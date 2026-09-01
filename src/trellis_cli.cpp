@@ -254,6 +254,16 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         so = trellis::shape_decode(m, slat_dn, shc, RES); m.free();
         printf("      decoded voxels @res%d = %d\n", so.res, (int)so.coords.size());
         mesh = trellis::dual_grid_to_mesh(so);
+        // feats7 is consumed by dual_grid_to_mesh and is never referenced again.
+        // Release it before the enormous host-side topology passes; on the
+        // 31M-voxel torture case this returns ~830 MiB immediately.
+        const size_t shape_feat_bytes = so.feats7.capacity() * sizeof(float);
+        std::vector<float>().swap(so.feats7);
+        if (shape_feat_bytes >= (size_t)128 * 1024 * 1024) {
+            printf("      [host-mem] released shape feats7 %.2f GiB before mesh postprocess\n",
+                   shape_feat_bytes / (1024.0*1024.0*1024.0));
+            fflush(stdout);
+        }
     }
     printf("      mesh V=%d F=%d\n", mesh.V(), mesh.F());
     {   // reference postprocess fills small holes BEFORE the remesh (max_hole_perimeter=3e-2):
@@ -289,7 +299,15 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             trellis::Model m = trellis::Model::load(M + "/shape_dec.gguf", gpu);
             so_tex = trellis::shape_decode(m, lr_dn, coords, 512); m.free();
             pbr_coords = &so_tex.coords; pbr_res = so_tex.res;
+            // The texture decoder needs only coords+subdivision masks from this
+            // guide; its 7-channel shape features are dead weight from here on.
+            std::vector<float>().swap(so_tex.feats7);
+            // Mixed mode now samples PBR from so_tex.coords, so the giant HR
+            // coordinate table can also be returned to the OS before tex flow.
+            std::vector<std::array<int,3>>().swap(so.coords);
             printf("      res-512 tex-guide decode: %d voxels\n", (int)so_tex.coords.size());
+            printf("      [host-mem] mixed texture: released HR shape coords + tex-guide feats7\n");
+            fflush(stdout);
         }
         // tex flow + decode inputs: HR path (shc/slat_norm/cond_dec/so.subs) vs res-512 mixed path
         // (coords/lr_norm/cond_512/so_tex.subs). The tex decoder upsamples via the guide subdivision.
@@ -333,6 +351,10 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             }
             printf("      PBR voxels=%d @res%d\n", Mv, pbr_res);
         }
+        // Texture decode has consumed the subdivision guides.  Release their
+        // backing storage before the raw 100M+ face mesh enters weld/hole/BVH.
+        std::vector<std::vector<uint8_t>>().swap(so.subs);
+        std::vector<std::vector<uint8_t>>().swap(so_tex.subs);
         // `colors` is per-VOXEL but consumed per-VERTEX (weld, vertex-color GLB, PLY),
         // relying on dual_grid_to_mesh's vertex==voxel correspondence. fill_holes adds
         // cap vertices beyond Mv -- pad them (neutral grey; the caps are sub-voxel and

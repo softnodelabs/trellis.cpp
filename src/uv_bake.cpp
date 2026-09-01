@@ -507,7 +507,7 @@ int fill_holes(std::vector<float>& verts, std::vector<int32_t>& faces, float max
     if (F == 0) return 0;
     // count undirected edge uses; remember one directed representative
     std::unordered_map<uint64_t, std::pair<int,uint64_t>> euse;   // key -> {count, directed (u<<32|v)}
-    euse.reserve(F * 3);
+    euse.reserve(F * 2);
     auto ekey = [](int a, int b) -> uint64_t { if (a > b) { int t = a; a = b; b = t; } return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b; };
     for (size_t f = 0; f < F; ++f) {
         const int32_t* t = &faces[3*f];
@@ -611,29 +611,62 @@ void taubin_smooth(std::vector<float>& verts, const std::vector<int32_t>& faces,
 }
 
 int fill_small_holes(std::vector<int32_t>& faces, int max_loop) {
-    const size_t F = faces.size() / 3;
-    auto ekey = [](int a, int b){ return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b; };
-    std::unordered_map<uint64_t, int> dir;
-    dir.reserve(F * 3 * 2);
-    for (size_t f = 0; f < F; ++f)
-        for (int j = 0; j < 3; ++j)
-            dir[ekey(faces[3*f+j], faces[3*f+(j+1)%3])]++;
-    // Boundary edges traversed opposite to face winding so fan fills keep
-    // orientation consistent with their neighbors. Chains pass only through
-    // unambiguous boundary vertices (out- and in-degree exactly 1): at
-    // non-manifold junctions a single-successor map silently cross-links
-    // fragments of different holes into bogus mesh-spanning "loops".
-    std::unordered_map<int, int> nxt, outd, ind;
-    for (const auto& [k, cnt] : dir) {
-        const int a = (int)(k >> 32), b = (int)(uint32_t)k;
-        if (cnt == 1 && dir.find(ekey(b, a)) == dir.end()) {
-            nxt[b] = a; outd[b]++; ind[a]++;
+    // Memory-scaled equivalent of the old two-hash-table implementation.
+    // On dense 1024 meshes F can exceed 100M; keeping directed and undirected
+    // edge maps alive together can require tens of GiB.  Both passes only need
+    // the boundary edge set, so collect it with ONE undirected use-count map,
+    // release that map, run the directed loop pass, then recollect after any
+    // new fan faces before the winding-agnostic pass.  Boundary semantics are
+    // unchanged: an edge is a boundary iff its undirected use count is exactly 1.
+    auto dkey = [](int a, int b){ return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b; };
+    auto ukey = [](int a, int b){
+        if (a > b) std::swap(a, b);
+        return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b;
+    };
+
+    auto collect_boundary = [&](const char* pass) {
+        const size_t F = faces.size() / 3;
+        struct Use { int count = 0; uint64_t directed = 0; };
+        std::unordered_map<uint64_t, Use> euse;
+        // This is the same asymptotic map as fill_holes(), which already runs
+        // successfully on the decoded mesh before texture generation.  Do not
+        // over-reserve 6*F buckets like the previous fill_small_holes path.
+        euse.reserve(F * 3);
+        for (size_t f = 0; f < F; ++f) {
+            for (int j = 0; j < 3; ++j) {
+                const int a = faces[3*f+j], b = faces[3*f+(j+1)%3];
+                auto& e = euse[ukey(a, b)];
+                ++e.count;
+                if (e.count == 1) e.directed = dkey(a, b);
+            }
         }
+        std::vector<uint64_t> boundary;
+        // Boundary edges are normally tiny compared with all triangle edges;
+        // avoid a giant speculative reserve and let this vector grow naturally.
+        for (const auto& kv : euse)
+            if (kv.second.count == 1) boundary.push_back(kv.second.directed);
+        if (F >= 1000000) {
+            printf("  [fill-holes-stream] %s F=%zu boundary=%zu (single edge map)\n",
+                   pass, F, boundary.size());
+            fflush(stdout);
+        }
+        // Force release before allocating the small successor/adjacency maps.
+        decltype(euse)().swap(euse);
+        return boundary;
+    };
+
+    // Pass 1: directed boundary walk, same winding-preserving behavior as before.
+    std::vector<uint64_t> boundary = collect_boundary("directed");
+    std::unordered_map<int, int> nxt, outd, ind;
+    for (uint64_t k : boundary) {
+        const int a = (int)(k >> 32), b = (int)(uint32_t)k;
+        nxt[b] = a; outd[b]++; ind[a]++;
     }
     std::unordered_map<int, bool> used;
     int filled = 0;
     size_t added = 0;
     for (const auto& [start, first] : nxt) {
+        (void)first;
         if (used[start] || outd[start] != 1 || ind[start] != 1) continue;
         std::vector<int> loop = {start};
         int cur = start;
@@ -654,47 +687,49 @@ int fill_small_holes(std::vector<int32_t>& faces, int max_loop) {
         }
         ++filled;
     }
-    // Second pass, winding-agnostic (the GLB material is double-sided): loops
-    // whose boundary direction flips (simplification tears) never chain in the
-    // directed walk above. Assemble them over undirected boundary adjacency,
-    // restricted to unambiguous degree-2 vertices.
-    {
-        const size_t F2 = faces.size() / 3;
-        std::unordered_map<uint64_t, int> und;
-        und.reserve(F2 * 3 * 2);
-        for (size_t f = 0; f < F2; ++f)
-            for (int j = 0; j < 3; ++j) {
-                const int a = faces[3*f+j], b = faces[3*f+(j+1)%3];
-                und[ekey(std::min(a,b), std::max(a,b))]++;
-            }
-        std::unordered_map<int, std::vector<int>> adj;
-        for (const auto& [k, cnt] : und) {
-            if (cnt != 1) continue;
-            const int a = (int)(k >> 32), b = (int)(uint32_t)k;
-            adj[a].push_back(b); adj[b].push_back(a);
+
+    // Release all pass-1 hash tables before the second full edge scan.
+    decltype(nxt)().swap(nxt);
+    decltype(outd)().swap(outd);
+    decltype(ind)().swap(ind);
+    decltype(used)().swap(used);
+
+    // Pass 2: if pass 1 changed topology, recompute the boundary AFTER its new
+    // fan faces.  If it filled nothing, the boundary set is unchanged and we
+    // can reuse it, avoiding a second 100M+-face scan entirely.
+    if (filled > 0) {
+        std::vector<uint64_t>().swap(boundary);
+        boundary = collect_boundary("undirected");
+    } else if (faces.size() / 3 >= 1000000) {
+        printf("  [fill-holes-stream] undirected: reusing boundary (directed pass filled 0)\n");
+        fflush(stdout);
+    }
+    std::unordered_map<int, std::vector<int>> adj;
+    for (uint64_t k : boundary) {
+        const int a = (int)(k >> 32), b = (int)(uint32_t)k;
+        adj[a].push_back(b); adj[b].push_back(a);
+    }
+    std::unordered_map<int, bool> used2;
+    for (const auto& [start, nbrs] : adj) {
+        if (used2[start] || nbrs.size() != 2) continue;
+        std::vector<int> loop = {start};
+        int prev = start, cur = nbrs[0];
+        bool cycle = false, clean = true;
+        for (int steps = 0; steps <= max_loop; ++steps) {
+            auto it = adj.find(cur);
+            if (it == adj.end() || it->second.size() != 2 || used2[cur]) { clean = false; break; }
+            if (cur == start) { cycle = true; break; }
+            loop.push_back(cur);
+            const int nx = it->second[0] == prev ? it->second[1] : it->second[0];
+            prev = cur; cur = nx;
         }
-        std::unordered_map<int, bool> used2;
-        for (const auto& [start, nbrs] : adj) {
-            if (used2[start] || nbrs.size() != 2) continue;
-            std::vector<int> loop = {start};
-            int prev = start, cur = nbrs[0];
-            bool cycle = false, clean = true;
-            for (int steps = 0; steps <= max_loop; ++steps) {
-                auto it = adj.find(cur);
-                if (it == adj.end() || it->second.size() != 2 || used2[cur]) { clean = false; break; }
-                if (cur == start) { cycle = true; break; }
-                loop.push_back(cur);
-                const int nx = it->second[0] == prev ? it->second[1] : it->second[0];
-                prev = cur; cur = nx;
-            }
-            for (int v : loop) used2[v] = true;
-            if (!clean || !cycle || loop.size() < 3 || (int)loop.size() > max_loop) continue;
-            for (size_t i = 1; i + 1 < loop.size(); ++i) {
-                faces.push_back(loop[0]); faces.push_back(loop[i]); faces.push_back(loop[i+1]);
-                added += 1;
-            }
-            ++filled;
+        for (int v : loop) used2[v] = true;
+        if (!clean || !cycle || loop.size() < 3 || (int)loop.size() > max_loop) continue;
+        for (size_t i = 1; i + 1 < loop.size(); ++i) {
+            faces.push_back(loop[0]); faces.push_back(loop[i]); faces.push_back(loop[i+1]);
+            added += 1;
         }
+        ++filled;
     }
     if (filled) { printf("  fill_holes: %d boundary loops filled (+%zu faces)\n", filled, added); fflush(stdout); }
     return filled;

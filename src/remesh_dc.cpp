@@ -76,7 +76,20 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
     {
         const int F = (int)iF;
         std::vector<std::vector<uint64_t>> parts;
-        const int nt = std::max(1u, std::thread::hardware_concurrency());
+        const int hw = (int)std::max(1u, std::thread::hardware_concurrency());
+        // Each worker previously allocated a full res^3 candidate bitset.  At
+        // res=1024 that is 128 MiB per worker, so a 32-thread CPU consumed ~4 GiB
+        // here before any geometry/BVH memory.  Cap only the replication memory;
+        // the OR result and therefore the remesh are bit-for-bit equivalent.
+        const size_t bytes_per_part = cand.size() * sizeof(uint64_t);
+        const size_t parts_budget = (size_t)1024 * 1024 * 1024; // 1 GiB
+        const int mem_workers = bytes_per_part ? (int)std::max<size_t>(1, parts_budget / bytes_per_part) : hw;
+        const int nt = std::max(1, std::min(hw, mem_workers));
+        if (nt < hw) {
+            printf("  [remesh-mem] candidate bitset %.1f MiB/worker, workers %d->%d\n",
+                   bytes_per_part / (1024.0*1024.0), hw, nt);
+            fflush(stdout);
+        }
         parts.assign(nt, {});
         std::vector<std::thread> ts;
         const int chunk = (F + nt - 1) / nt;

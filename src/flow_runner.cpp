@@ -38,7 +38,12 @@ DitRunner::DitRunner(const Model& m, const DiTParams& p, int N, int n_cond,
                      const std::vector<float>& rcos, const std::vector<float>& rsin)
     : m_(m), p_(p), N_(N), Lc_(n_cond) {
     const int half = p_.head_dim / 2;
-    size_t meta = ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(32768, false) + (1 << 20);
+    // Query-chunked FlashAttention creates several small mask/FA nodes per attention instead
+    // of one giant quadratic mask. Give the graph generous HOST metadata headroom; this does
+    // not reserve an equivalent amount of VRAM.
+    static constexpr size_t kDitGraphNodes = 65536;
+    size_t meta = ggml_tensor_overhead() * kDitGraphNodes +
+                  ggml_graph_overhead_custom(kDitGraphNodes, false) + (1 << 20);
     ctx_ = ggml_init({ meta, nullptr, true });
     gh0_  = ggml_new_tensor_2d(ctx_, GGML_TYPE_F32, p_.in_ch, N_);   ggml_set_input(gh0_);
     gtf_  = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, 256);            ggml_set_input(gtf_);
@@ -47,12 +52,21 @@ DitRunner::DitRunner(const Model& m, const DiTParams& p, int N, int n_cond,
     gsin_ = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32, 1, half, 1, N_); ggml_set_input(gsin_);
     dbg_nan_ = std::getenv("TRELLIS_DBG_NAN") != nullptr;
     gout_ = build_dit_dense(ctx_, m_, p_, gh0_, gtf_, gcond_, gcos_, gsin_, dbg_nan_ ? &inter_ : nullptr);
-    g_ = ggml_new_graph_custom(ctx_, 32768, false);
+    g_ = ggml_new_graph_custom(ctx_, kDitGraphNodes, false);
     ggml_build_forward_expand(g_, gout_);
     ggml_set_output(gout_);
     if (dbg_nan_) for (auto& [nm, t] : inter_) { ggml_build_forward_expand(g_, t); ggml_set_output(t); }
     alloc_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m_.backend));
-    if (!ggml_gallocr_alloc_graph(alloc_, g_)) throw std::runtime_error("DitRunner: alloc failed");
+    if (!ggml_gallocr_alloc_graph(alloc_, g_)) {
+        // Constructors that throw do not run DitRunner::~DitRunner(), so explicitly release
+        // partial allocator/context state before propagating the failure.
+        ggml_gallocr_free(alloc_); alloc_ = nullptr;
+        ggml_free(ctx_); ctx_ = nullptr;
+        throw std::runtime_error("DitRunner: alloc failed");
+    }
+    if (getenv("TRELLIS_DBG_ALLOC"))
+        fprintf(stderr, "      [dit-alloc] N=%d nodes=%d gallocr buffer = %.2f GB\n",
+                N_, ggml_graph_n_nodes(g_), ggml_gallocr_get_buffer_size(alloc_, 0) / 1e9);
     rcos_ = rcos; rsin_ = rsin;   // keep; re-upload each forward (gallocr reuses input buffers across runs)
 }
 

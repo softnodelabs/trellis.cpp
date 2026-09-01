@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <string>
 
@@ -65,8 +66,8 @@ static T* apply_rope(ggml_context* c, T* x, T* cos, T* sin) {
 // An FA padding mask [Lk_pad, Lq] (F16): 0 for real keys (< Lk_real), a large negative for the
 // zero-padded tail. WITHOUT it, ggml's CUDA FlashAttention folds the (zero) padded keys into the
 // softmax; on the >=1024-token HR flow that path NaNs a subset of queries (props, <1024 tokens, dodge
-// it). WITH it the kernel masks/skips the padded KV tiles -> correct softmax, no NaN. Built once per
-// flow (same N every block) and threaded into every attention; -30000 (not -inf) so 0*mask can't NaN.
+// it). WITH it the kernel masks/skips the padded KV tiles -> correct softmax, no NaN. Large flows build
+// this per QUERY CHUNK (not full Lq) so the mask stays bounded; -30000 (not -inf) so 0*mask can't NaN.
 static T* build_pad_mask(ggml_context* c, int64_t Lk_real, int64_t Lq) {
     const int64_t KQ = 256;
     const int64_t Lk_pad = ((Lk_real + KQ - 1) / KQ) * KQ;
@@ -138,10 +139,52 @@ static T* sdpa(ggml_context* c, T* q, T* k, T* v, int d_model, T* mask = nullptr
         // ignored and the zero-padded keys are diluting the softmax (exp(0-rowmax) is only
         // negligible when rowmax >> 0), which shrinks every output toward zero.
         static const bool fa_nomask = std::getenv("TRELLIS_FA_NOMASK") != nullptr;
-        T* out = ggml_flash_attn_ext(c, qf, kf, vf, fa_nomask ? nullptr : mask, scale, 0.0f, 0.0f);  // [hd, nh, Lq]
-        if (!fa_fast) ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
-        out = ggml_scale(c, out, 1.0f / V_SCALE);
-        return ggml_reshape_2d(c, out, d_model, out->ne[2]);   // [d_model, Lq]
+
+        // IMPORTANT: the padding mask depends only on KEY index, but ggml FlashAttention
+        // requires it expanded to [Lk_pad, Lq_pad]. At 37,017 self-attention tokens that one
+        // F16 tensor is exactly 2,751,037,440 bytes -- the allocation seen in the real failure
+        // log. FlashAttention itself is tiled, so do the same for the mask: attention is
+        // independent per query, therefore query chunks are mathematically identical while
+        // reducing the mask from O(Lq*Lk) residency to O(nq*Lk).
+        const int64_t hd = qf->ne[0], Lq = qf->ne[1], nh = qf->ne[2];
+        const int64_t Lk_real = k->ne[2];
+        const int64_t Lk_pad = ((Lk_real + KQ_STRIDE - 1) / KQ_STRIDE) * KQ_STRIDE;
+        static constexpr int64_t kDefaultFaMaskChunkBytes = 256ll * 1024 * 1024;
+        int64_t mask_budget = kDefaultFaMaskChunkBytes;
+        if (const char* e = getenv("TRELLIS_FA_MASK_CHUNK_MB")) {
+            const int64_t mb = atoll(e);
+            if (mb > 0) mask_budget = mb * 1024 * 1024;
+        }
+        int64_t nq = Lq;
+        if (!fa_nomask) {
+            const int64_t bytes_per_q = std::max<int64_t>(1, Lk_pad * (int64_t)sizeof(uint16_t));
+            nq = std::max<int64_t>(1, mask_budget / bytes_per_q);
+            // FA's mask reader works in 64-query tiles. Round ordinary chunks down to a
+            // multiple of 64 so only the final chunk needs padding.
+            if (nq >= 64 && nq < Lq) nq = (nq / 64) * 64;
+            if (nq > Lq) nq = Lq;
+        }
+
+        T* out_all = nullptr;
+        for (int64_t q0 = 0; q0 < Lq; q0 += nq) {
+            const int64_t n = std::min<int64_t>(nq, Lq - q0);
+            T* qc = (n == Lq)
+                ? qf
+                : ggml_cont(c, ggml_view_3d(c, qf, hd, n, nh,
+                                             qf->nb[1], qf->nb[2], (size_t)q0 * qf->nb[1]));
+            T* cmask = nullptr;
+            if (!fa_nomask) {
+                // A caller-supplied mask is only safe to reuse when this attention was not
+                // query-chunked. build_dit_dense no longer creates the giant full mask.
+                cmask = (mask && n == Lq) ? mask : build_pad_mask(c, Lk_real, n);
+            }
+            T* o = ggml_flash_attn_ext(c, qc, kf, vf, cmask, scale, 0.0f, 0.0f); // [hd,nh,n]
+            if (!fa_fast) ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+            o = ggml_scale(c, o, 1.0f / V_SCALE);
+            o = ggml_reshape_2d(c, o, d_model, o->ne[2]);          // [d_model,n]
+            out_all = out_all ? ggml_concat(c, out_all, o, 1) : o;
+        }
+        return out_all;                                           // [d_model,Lq]
     }
     // Exact SDPA, chunked over QUERIES. The whole reason FA exists here is the [Lk, Lq, nh]
     // score matrix -- at the HR flow that is 15104*15006*12*4 = 10.9 TB, so it cannot be
@@ -275,13 +318,11 @@ ggml_tensor* build_dit_dense(ggml_context* c, const Model& m, const DiTParams& p
     T* mod = lin(c, m, "adaLN_modulation.1", ggml_silu(c, te));// [6*d_model]
     keep("t_emb_mod", mod);
 
-    // Padding masks for the two attentions, built ONCE (token counts are fixed across blocks) and
-    // shared by every block — they tell the CUDA FlashAttention to exclude the zero-padded key tiles
-    // (else the >=1024-token flow NaNs a subset of queries). self: Lk=L (the latent); cross: Lk=Lc.
-    T* self_mask  = build_pad_mask(c, h0->ne[1], h0->ne[1]);
-    T* cross_mask = build_pad_mask(c, cond->ne[1], h0->ne[1]);
+    // FlashAttention padding masks used to be built once at full [Lk_pad,Lq_pad] size.
+    // That becomes a 2.75 GB single tensor at 37,017 tokens. sdpa() now creates an identical
+    // mask per QUERY CHUNK, so there is deliberately no full-flow mask tensor here.
     for (int i = 0; i < p.n_blocks; ++i) {
-        h = block(c, m, i, h, mod, cond, cos, sin, p, inter, self_mask, cross_mask);
+        h = block(c, m, i, h, mod, cond, cos, sin, p, inter, nullptr, nullptr);
         if (i == 0) keep("after_block0", h);
         if (i == 1) keep("after_block1", h);
         if (i == p.n_blocks - 1) keep("after_block29", h);
