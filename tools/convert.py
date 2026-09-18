@@ -16,8 +16,14 @@ import json, struct, sys, os
 import numpy as np
 import gguf
 
-MODELS = "/media/ilintar/D_SSD/models/trellis2"
-OUT = f"{MODELS}/gguf"
+MODELS = os.environ.get("TRELLIS_MODELS", "/media/ilintar/D_SSD/models/trellis2")
+OUT = os.environ.get("TRELLIS_GGUF_OUT", f"{MODELS}/gguf")
+# ss_dec and dinov3 live under directory layouts that don't line up with MODELS on
+# every host (e.g. the Pixal3D snapshot has no tilarge/ subfolder, and the DINOv3
+# timm checkpoint lives in the HF cache) -> dedicated overrides, same defaults as before.
+SS_DEC_CKPT = os.environ.get("TRELLIS_SS_DEC_CKPT", f"{MODELS}/tilarge/ckpts/ss_dec_conv3d_16l8_fp16")
+DINOV3_CKPT = os.environ.get("TRELLIS_DINOV3_CKPT", f"{MODELS}/dinov3")
+NAF_CKPT = os.environ.get("TRELLIS_NAF_CKPT", f"{MODELS}/naf/naf")
 
 # component -> (safetensors path, config json path or None, gguf arch tag)
 MANIFEST = {
@@ -35,13 +41,49 @@ MANIFEST = {
                        f"{MODELS}/ckpts/shape_dec_next_dc_f16c32_fp16.json",       "trellis2-shape-dec"),
     "tex_dec":        (f"{MODELS}/ckpts/tex_dec_next_dc_f16c32_fp16.safetensors",
                        f"{MODELS}/ckpts/tex_dec_next_dc_f16c32_fp16.json",         "trellis2-tex-dec"),
-    "ss_dec":         (f"{MODELS}/tilarge/ckpts/ss_dec_conv3d_16l8_fp16.safetensors",
-                       f"{MODELS}/tilarge/ckpts/ss_dec_conv3d_16l8_fp16.json",     "trellis2-ss-dec"),
-    "dinov3":         (f"{MODELS}/dinov3/model.safetensors",
-                       f"{MODELS}/dinov3/config.json",                             "dinov3-vitl16"),
+    "ss_dec":         (f"{SS_DEC_CKPT}.safetensors",
+                       f"{SS_DEC_CKPT}.json",                                      "trellis2-ss-dec"),
+    "dinov3":         (f"{DINOV3_CKPT}/model.safetensors",
+                       f"{DINOV3_CKPT}/config.json",                               "dinov3-vitl16"),
     "birefnet":       (f"{MODELS}/birefnet/model.safetensors",
                        f"{MODELS}/birefnet/config.json",                           "birefnet-swinl"),
+    # Pixal3D multiview flow DiTs (reuse TRELLIS.2's ckpt dir layout under MODELS/ckpts).
+    "pixal3d_ss_flow_mv":         (f"{MODELS}/ckpts/ss_flow_img_dit_1_3B_64_bf16_mv.safetensors",
+                       f"{MODELS}/ckpts/ss_flow_img_dit_1_3B_64_bf16_mv.json",     "pixal3d-ss-flow"),
+    "pixal3d_shape_flow_512_mv":  (f"{MODELS}/ckpts/slat_flow_img2shape_dit_1_3B_512_bf16_mv.safetensors",
+                       f"{MODELS}/ckpts/slat_flow_img2shape_dit_1_3B_512_bf16_mv.json", "pixal3d-slat-flow"),
+    "pixal3d_shape_flow_1024_mv": (f"{MODELS}/ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16_mv.safetensors",
+                       f"{MODELS}/ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16_mv.json", "pixal3d-slat-flow"),
+    "pixal3d_tex_flow_1024_mv":   (f"{MODELS}/ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16_mv.safetensors",
+                       f"{MODELS}/ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16_mv.json", "pixal3d-slat-flow"),
+    # Pixal3D single-view flow DiTs. The official checkpoints ship an `_mv` and a plain
+    # variant per stage; their config json is byte-identical and so are the tensor
+    # name/shape/dtype sets (701 / 700 entries, verified against the safetensors headers),
+    # so the same pixal3d-* architectures load both — only the weights differ.
+    "pixal3d_ss_flow_sv":         (f"{MODELS}/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
+                       f"{MODELS}/ckpts/ss_flow_img_dit_1_3B_64_bf16.json",         "pixal3d-ss-flow"),
+    "pixal3d_shape_flow_512_sv":  (f"{MODELS}/ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors",
+                       f"{MODELS}/ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.json", "pixal3d-slat-flow"),
+    "pixal3d_shape_flow_1024_sv": (f"{MODELS}/ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors",
+                       f"{MODELS}/ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.json", "pixal3d-slat-flow"),
+    "pixal3d_tex_flow_1024_sv":   (f"{MODELS}/ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors",
+                       f"{MODELS}/ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.json", "pixal3d-slat-flow"),
+    "pixal3d_naf": (f"{NAF_CKPT}.safetensors", f"{NAF_CKPT}.json", "pixal3d-naf"),
 }
+
+
+
+# 学習済みの「トークンそのもの」は f16 に落とさない。cls_token / reg_token /
+# pos_embed 類は行列積の重みではなく残差ストリームに直接足される値なので、丸め誤差が
+# そのままトークンの誤差になる。実測（2026-09-09, DINOv3 ViT-L）: f16 に落とすと
+# 埋め込みが PyTorch 参照に対して L2 相対 2.128e-04 ずれ、それが 24 ブロックを素通りして
+# 最終トークンの 6.2e-04 になり、conditioning の z_global の残差の主因になっていた。
+# f32 に戻しても cls 1024 + reg 4096 要素で 10 KB しか増えない。
+EMBED_TOKEN_SUFFIXES = ("cls_token", "reg_token", "mask_token", "pos_embed",
+                        "position_embeddings", "storage_tokens")
+
+def keep_f32(name):
+    return name.endswith(EMBED_TOKEN_SUFFIXES) or ".cls_token" in name or ".reg_token" in name
 
 
 def read_safetensors(path):
@@ -69,6 +111,11 @@ def read_safetensors(path):
                 arr = np.frombuffer(buf, dtype="<i8").astype(np.int64)
             elif dt == "I32":
                 arr = np.frombuffer(buf, dtype="<i4").astype(np.int32)
+            elif dt == "C64":
+                # complex RoPE phase buffers (Pixal3D stores rope_phases persistently);
+                # the C++ side recomputes RoPE tables on the host, so skip them.
+                print(f"  skipping {name} (dtype {dt}, shape {shape})")
+                continue
             else:
                 raise ValueError(f"unhandled dtype {dt} for {name}")
             arr = arr.reshape(shape) if shape else arr.reshape(())
@@ -107,6 +154,8 @@ def convert_birefnet(w, src):
             data = np.ascontiguousarray(arr.astype(np.int32)); n_f32 += 1
         elif name.endswith("relative_position_bias_table"):
             data = np.ascontiguousarray(arr.astype(np.float32)); n_f32 += 1   # keep precision for the bias gather
+        elif keep_f32(name):
+            data = np.ascontiguousarray(arr.astype(np.float32)); n_f32 += 1   # 埋め込みトークンは丸めない
         elif arr.ndim >= 2 and f16ok:
             data = np.ascontiguousarray(arr.astype(np.float16)); n_f16 += 1
         else:
@@ -148,7 +197,7 @@ def convert(component):
                 # dense Conv3d weight [OC,IC,KD,KH,KW] -> [OC*IC,KD,KH,KW] (ggml_conv_3d)
                 oc, ic = arr.shape[0], arr.shape[1]
                 arr = arr.reshape(oc * ic, arr.shape[2], arr.shape[3], arr.shape[4])
-        if arr.ndim >= 2 and not force_f32:
+        if arr.ndim >= 2 and not force_f32 and not keep_f32(name):
             data = np.ascontiguousarray(arr.astype(np.float16)); n_f16 += 1
         else:
             data = np.ascontiguousarray(arr.astype(np.float32)); n_f32 += 1
