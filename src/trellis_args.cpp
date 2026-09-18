@@ -2,10 +2,35 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
+#include <climits>
+#include <cmath>
 #include <cstring>
 #include <string>
 
 namespace trellis {
+namespace {
+// atoi/atof は "abc" を 0、"4x" を 4 として黙って受けるので、全体消費を要求する厳密版を使う。
+bool parse_int_strict(const char* s, int& out) {
+    if (!s || !*s) return false;
+    char* end = nullptr;
+    errno = 0;
+    const long v = std::strtol(s, &end, 10);
+    if (errno == ERANGE || !end || *end != '\0' || v < INT_MIN || v > INT_MAX) return false;
+    out = (int)v;
+    return true;
+}
+bool parse_float_strict(const char* s, float& out) {
+    if (!s || !*s) return false;
+    char* end = nullptr;
+    errno = 0;
+    const double v = std::strtod(s, &end);
+    if (!end || *end != '\0') return false;
+    out = (float)v;
+    return true;
+}
+} // namespace
+
 
 void print_usage(const char* argv0, bool server) {
     if (server) {
@@ -28,6 +53,17 @@ void print_usage(const char* argv0, bool server) {
         "  -s, --seed N            RNG seed                     (default 42)\n"
         "      --res 512|1024|1536 geometry resolution\n"
         "      --max-tokens N      HR token budget              (default 49152)\n"
+        "      --views DIR         Pixal3D multiview mode: DIR has transforms.json + RGBA\n"
+        "      --pixal3d-weights V sv|mv flow weights (default mv). sv expects 1 view;\n"
+        "                          mv expects 4. Requires --views.\n"
+        "                          views (frame 0 = main/front view). Mutually exclusive\n"
+        "                          with the positional/--image input; mandatory cascade\n"
+        "                          (--res 512 is not supported -- no res-512 texture flow)\n"
+        "      --num-views N       use only the first N transforms.json frames (default: all)\n"
+        "      --mesh-scale F      Pixal3D projection scale (> 0). Required when --views DIR\n"
+        "                          has no transforms.json (exactly 4 turntable views, natural\n"
+        "                          filename order = front, right, back, left, elevation 0,\n"
+        "                          FOV 20 deg); with transforms.json it overrides its value.\n"
         "      --bg-removal MODE   threshold | birefnet   (default: auto -- a pre-matted\n"
         "                          image keeps its alpha; otherwise BiRefNet when its model\n"
         "                          is present. The plain threshold matte cuts out specular\n"
@@ -63,7 +99,10 @@ void print_usage(const char* argv0, bool server) {
 }
 
 bool parse_args(int argc, char** argv, TrellisParams& p) {
-    int positional = 0;
+    // Positionals are collected and only assigned to image/output after the whole argv has
+    // been scanned, since --views (which can appear anywhere) changes what the first bare
+    // positional means (output, not image) -- see the assignment below.
+    std::string pos[2]; int npos = 0;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -85,6 +124,20 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         else if (a == "-s" || a == "--seed")    { const char* v = need(a.c_str()); if (!v) return false; p.seed = (uint32_t)atoi(v); }
         else if (a == "--res")                  { const char* v = need(a.c_str()); if (!v) return false; p.set_res(atoi(v)); }
         else if (a == "--max-tokens")           { const char* v = need(a.c_str()); if (!v) return false; p.max_tokens = atoi(v); }
+        else if (a == "--views")                { const char* v = need(a.c_str()); if (!v) return false; p.views = v; }
+        else if (a == "--pixal3d-weights")      { const char* v = need(a.c_str()); if (!v) return false;
+                                                  const std::string w = v;
+                                                  if (w != "sv" && w != "mv") {
+                                                      fprintf(stderr, "[trellis] --pixal3d-weights expects 'sv' or 'mv', got '%s'\n", v); return false; }
+                                                  p.pixal3d_weights = w; p.pixal3d_weights_set = true; }
+        else if (a == "--num-views")            { const char* v = need(a.c_str()); if (!v) return false;
+                                                  if (!parse_int_strict(v, p.num_views) || p.num_views <= 0) {
+                                                      fprintf(stderr, "[trellis] --num-views expects a positive integer, got '%s'\n", v); return false; }
+                                                  p.num_views_set = true; }
+        else if (a == "--mesh-scale")           { const char* v = need(a.c_str()); if (!v) return false;
+                                                  if (!parse_float_strict(v, p.mesh_scale) || !std::isfinite(p.mesh_scale) || p.mesh_scale <= 0.0f) {
+                                                      fprintf(stderr, "[trellis] --mesh-scale expects a finite value > 0, got '%s'\n", v); return false; }
+                                                  p.mesh_scale_set = true; }
         else if (a == "--bg-removal")           { const char* v = need(a.c_str()); if (!v) return false; p.birefnet = (std::strcmp(v, "birefnet") == 0) ? 1 : 0; }
         else if (a == "--birefnet")             { p.birefnet = 1; }
         else if (a == "--no-texture")           { p.texture = false; }
@@ -111,9 +164,25 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         else if (a == "--voxply")               { p.voxply = true; }
         else if (a == "--dump-slat")            { p.dump_slat = true; }
         else if (!a.empty() && a[0] == '-')     { fprintf(stderr, "[trellis] unknown option: %s\n", a.c_str()); return false; }
-        else if (positional == 0)               { p.image  = a; positional = 1; }
-        else if (positional == 1)               { p.output = a; positional = 2; }
+        else if (npos < 2)                      { pos[npos++] = a; }
         else                                    { fprintf(stderr, "[trellis] unexpected argument: %s\n", a.c_str()); return false; }
+    }
+
+    // Assign positionals now that --views (if any) is known: normally <image> <out.glb>;
+    // in --views mode there is no positional image, so the lone positional is the output.
+    // --pixal3d-weights は Pixal3D (--views) 経路専用。指定だけして TRELLIS.2 経路で走ると
+    // 「SV を実行した」と誤認されるので、ここで落とす。
+    if (p.pixal3d_weights_set && p.views.empty()) {
+        fprintf(stderr, "[trellis] --pixal3d-weights requires --views DIR (it selects Pixal3D flow weights)\n");
+        return false;
+    }
+    if (!p.views.empty()) {
+        if (!p.image.empty()) { fprintf(stderr, "[trellis] --views and --image/positional image are mutually exclusive\n"); return false; }
+        if (npos > 1)         { fprintf(stderr, "[trellis] unexpected argument: %s\n", pos[1].c_str()); return false; }
+        if (npos == 1) p.output = pos[0];
+    } else {
+        if (npos >= 1) p.image  = pos[0];
+        if (npos >= 2) p.output = pos[1];
     }
     return true;
 }

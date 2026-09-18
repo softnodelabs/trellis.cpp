@@ -106,6 +106,15 @@ add_library(trellis_core STATIC
   src/tri_bvh.cpp
   src/remesh_dc.cpp
   src/decimate_qem.cpp
+  src/proj_grid.cpp
+  src/pixal3d_cond.cpp
+  src/pixal3d_cond_gpu.cpp
+  src/naf.cpp
+  src/naf_gpu.cpp
+  src/transforms_json.cpp
+  src/pixal3d_input.cpp
+  src/pixal3d_postprocess.cpp
+  src/graph_dump.cpp
 )
 target_include_directories(trellis_core PUBLIC include ${GGML_DIR}/include ${CMAKE_SOURCE_DIR}/thirdparty/stb ${CMAKE_SOURCE_DIR}/thirdparty/xatlas ${CMAKE_SOURCE_DIR}/thirdparty/meshoptimizer ${CMAKE_SOURCE_DIR}/thirdparty/fqms)
 target_compile_definitions(trellis_core PRIVATE TRELLIS_GIT_COMMIT="${TRELLIS_GIT_COMMIT}" TRELLIS_GIT_DIRTY=${TRELLIS_GIT_DIRTY} TRELLIS_BUILD_TIMESTAMP="${TRELLIS_BUILD_TIMESTAMP_UTC}" TRELLIS_APP_VERSION="${TRELLIS_APP_VERSION}")
@@ -144,6 +153,8 @@ if(TARGET ggml-cuda)
   target_sources(trellis_core PRIVATE src/deform_conv.cu)
   # Self-contained CUDA QEM decimation (mirrors the CPU port; uses cub for scan/sort/RLE).
   target_sources(trellis_core PRIVATE src/decimate_qem.cu)
+  # NAF neighborhood attention; other GPU backends take the all-ggml path in naf_gpu.cpp.
+  target_sources(trellis_core PRIVATE src/naf_attn.cu)
   if(MSVC)
     # CUDA 13.3 CCCL requires MSVC's conforming preprocessor for host compilation.
     target_compile_options(trellis_core PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>")

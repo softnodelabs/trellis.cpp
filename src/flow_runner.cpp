@@ -1,5 +1,6 @@
 #include "flow_runner.h"
 #include "trellis_model.h"
+#include "graph_dump.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
@@ -9,6 +10,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <stdexcept>
+#include <string>
 #if defined(_WIN32)
 #include <io.h>
 #else
@@ -34,14 +36,73 @@ static void timestep_embedding(float t, std::vector<float>& out) {
     }
 }
 
+// グラフを組んだ直後に、このデバイスで実際に回せるかを判定する。
+//
+// 2026-09-08 に踏んだ事故の再発防止: WebGPU のデバイス予算は実測 4095 MB しかなく、
+// テクスチャ flow を N=17690 で回すと 重み 2647 + 活性化 1888 + cond 276 = 4818 MB で
+// 超過する。超過しても確保は成功してしまい、その後ユニファイドメモリ上で Metal が
+// メモリを往復させ続ける。1 forward が 40 秒から 139〜176 秒に伸び、その帯域を
+// WindowServer ごと奪ってマシン全体が固まった（復旧に再起動を要した）。
+// 「走らせてから固まる」を避けるため、走らせる前に落とす。
+//
+// 必要量は N にほぼ比例する（実測 75.7 KB/token、内訳は活性化 59.7 + cond 16.0）。
+// 予算 4095 MB では N ≒ 19600 が上限。詳細は docs/PIXAL3D_WEBGPU_MEMORY.md。
+void DitRunner::check_device_budget() const {
+    ggml_backend_dev_t dev = ggml_backend_get_device(m_.backend);
+    if (!dev) return;
+    size_t dev_free_sz = 0, dev_total_sz = 0;
+    ggml_backend_dev_memory(dev, &dev_free_sz, &dev_total_sz);
+    // dev_total も 64 bit で持つ。wasm32 では size_t が 32 bit なので、下の上書きで
+    // TRELLIS_DEVICE_BUDGET_MB=4096 がちょうど 2^32 になり 0 に落ちる。0 になると
+    // 直後の early return でゲートが丸ごと無効化される（4096 超も周回して過小予算になる）。
+    // 4095 MB がブラウザの実測予算なので、この境界は実運用の値そのもの。
+    uint64_t dev_total = dev_total_sz;
+    (void)dev_free_sz;
+    // ブラウザの予算（実測 4095 MB）を native から模擬してゲート自体を検証するための上書き。
+    // ブラウザを起動せずに「この N はブラウザで通るか」を native で判定できる。
+    if (const char* e = getenv("TRELLIS_DEVICE_BUDGET_MB")) dev_total = (uint64_t)std::max<int64_t>(0, atoll(e)) * 1048576ull;
+    if (dev_total == 0) return;                       // 報告しない backend（CPU 等）は素通り
+
+    // cond は forward ごとに再アップロードされ、negative 側と 2 本同時に載る。
+    // 合計は uint64_t で持つ。wasm32 では size_t が 32 bit なので、ちょうどこのゲートが
+    // 効いてほしい 4 GiB 超で加算が周回し、超過を「収まっている」と誤判定する。
+    const uint64_t cond_bytes = p_.proj_attn ? (uint64_t)p_.d_proj * N_ * 4 * 2 : 0;
+    const uint64_t need = (uint64_t)m_.total_bytes() + (uint64_t)alloc_bytes_ + cond_bytes;
+    const double MB = 1.0 / 1048576.0;
+    const bool over = need > dev_total;
+    if (over || getenv("TRELLIS_DBG_BUDGET"))
+        fprintf(stderr,
+                "[budget] N=%d  weights %.0f + activations %.0f + cond %.0f = %.0f MB "
+                "/ device %.0f MB%s\n",
+                N_, m_.total_bytes() * MB, alloc_bytes_ * MB, cond_bytes * MB, need * MB,
+                dev_total * MB, over ? "  ** OVER **" : "");
+    if (!over) return;
+    if (getenv("TRELLIS_ALLOW_OVER_BUDGET")) {        // 意図的に踏むとき用の逃がし弁
+        fprintf(stderr, "[budget] TRELLIS_ALLOW_OVER_BUDGET が設定されているので続行する\n");
+        return;
+    }
+    char msg[640];
+    snprintf(msg, sizeof msg,
+             "DitRunner: this token count does not fit the device memory budget. "
+             "N=%d needs %.0f MB (weights %.0f + activations %.0f + cond %.0f) "
+             "but the device reports %.0f MB. Running anyway thrashes unified memory and "
+             "can hang the whole machine. Options: lower TRELLIS_ATTN_CHUNK_MB (activations "
+             "scale with it on the non-FlashAttention path this backend uses), reduce N, "
+             "quantize the flow weights, or set TRELLIS_ALLOW_OVER_BUDGET=1 to override. "
+             "TRELLIS_MLP_CHUNK_MB does NOT help here -- measured zero effect on the "
+             "non-FA/WebGPU path; it only lowers the peak on the FlashAttention path.",
+             N_, need * MB, m_.total_bytes() * MB, alloc_bytes_ * MB, cond_bytes * MB, dev_total * MB);
+    throw std::runtime_error(msg);
+}
+
 DitRunner::DitRunner(const Model& m, const DiTParams& p, int N, int n_cond,
                      const std::vector<float>& rcos, const std::vector<float>& rsin)
     : m_(m), p_(p), N_(N), Lc_(n_cond) {
     const int half = p_.head_dim / 2;
-    // Query-chunked FlashAttention creates several small mask/FA nodes per attention instead
-    // of one giant quadratic mask. Give the graph generous HOST metadata headroom; this does
-    // not reserve an equivalent amount of VRAM.
-    static constexpr size_t kDitGraphNodes = 65536;
+    // Query-chunked FlashAttention adds about eight small nodes per chunk, and the projected
+    // attention of Pixal3D adds more per block. Give the graph generous HOST metadata headroom;
+    // this does not reserve an equivalent amount of VRAM.
+    static constexpr size_t kDitGraphNodes = 262144;
     size_t meta = ggml_tensor_overhead() * kDitGraphNodes +
                   ggml_graph_overhead_custom(kDitGraphNodes, false) + (1 << 20);
     ctx_ = ggml_init({ meta, nullptr, true });
@@ -50,12 +111,21 @@ DitRunner::DitRunner(const Model& m, const DiTParams& p, int N, int n_cond,
     gcond_= ggml_new_tensor_2d(ctx_, GGML_TYPE_F32, p_.d_cond, Lc_); ggml_set_input(gcond_);
     gcos_ = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32, 1, half, 1, N_); ggml_set_input(gcos_);
     gsin_ = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32, 1, half, 1, N_); ggml_set_input(gsin_);
+    if (p_.proj_attn) {
+        gproj_ = ggml_new_tensor_2d(ctx_, GGML_TYPE_F32, p_.d_proj, N_); ggml_set_input(gproj_);
+    }
+    gidx_ = ggml_new_tensor_1d(ctx_, GGML_TYPE_I32, p_.head_dim); ggml_set_input(gidx_);
+    dit_rope_index(p_.head_dim, ridx_);
     dbg_nan_ = std::getenv("TRELLIS_DBG_NAN") != nullptr;
-    gout_ = build_dit_dense(ctx_, m_, p_, gh0_, gtf_, gcond_, gcos_, gsin_, dbg_nan_ ? &inter_ : nullptr);
+    gout_ = build_dit_dense(ctx_, m_, p_, gh0_, gtf_, gcond_, gcos_, gsin_,
+                            dbg_nan_ ? &inter_ : nullptr, gproj_, gidx_);
     g_ = ggml_new_graph_custom(ctx_, kDitGraphNodes, false);
     ggml_build_forward_expand(g_, gout_);
     ggml_set_output(gout_);
     if (dbg_nan_) for (auto& [nm, t] : inter_) { ggml_build_forward_expand(g_, t); ggml_set_output(t); }
+    const std::string tag = "dit_N" + std::to_string(N_) + "_dcond" + std::to_string(Lc_) + "_proj" + std::to_string((int)p_.proj_attn);
+    trellis_graph_dump(tag.c_str(), g_);
+    check_graph_supported(m_.backend, g_, tag.c_str());
     alloc_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m_.backend));
     if (!ggml_gallocr_alloc_graph(alloc_, g_)) {
         // Constructors that throw do not run DitRunner::~DitRunner(), so explicitly release
@@ -63,6 +133,14 @@ DitRunner::DitRunner(const Model& m, const DiTParams& p, int N, int n_cond,
         ggml_gallocr_free(alloc_); alloc_ = nullptr;
         ggml_free(ctx_); ctx_ = nullptr;
         throw std::runtime_error("DitRunner: alloc failed");
+    }
+    alloc_bytes_ = ggml_gallocr_get_buffer_size(alloc_, 0);
+    try {
+        check_device_budget();
+    } catch (...) {
+        ggml_gallocr_free(alloc_); alloc_ = nullptr;
+        ggml_free(ctx_); ctx_ = nullptr;
+        throw;
     }
     if (getenv("TRELLIS_DBG_ALLOC"))
         fprintf(stderr, "      [dit-alloc] N=%d nodes=%d gallocr buffer = %.2f GB\n",
@@ -75,13 +153,19 @@ DitRunner::~DitRunner() {
     if (ctx_)   ggml_free(ctx_);
 }
 
-std::vector<float> DitRunner::forward(const std::vector<float>& xt, float t_scaled, const float* cond) {
+std::vector<float> DitRunner::forward(const std::vector<float>& xt, float t_scaled, const float* cond,
+                                      const float* proj) {
     std::vector<float> tf; timestep_embedding(t_scaled, tf);
     ggml_backend_tensor_set(gh0_,  xt.data(), 0, xt.size() * 4);
     ggml_backend_tensor_set(gtf_,  tf.data(), 0, tf.size() * 4);
     ggml_backend_tensor_set(gcond_, cond,     0, (size_t)p_.d_cond * Lc_ * 4);
     ggml_backend_tensor_set(gcos_, rcos_.data(), 0, rcos_.size() * 4);   // re-upload (buffers reused across runs)
     ggml_backend_tensor_set(gsin_, rsin_.data(), 0, rsin_.size() * 4);
+    ggml_backend_tensor_set(gidx_, ridx_.data(), 0, ridx_.size() * sizeof(int32_t));
+    if (gproj_) {
+        if (!proj) throw std::runtime_error("DitRunner: proj_attn model requires a proj tensor");
+        ggml_backend_tensor_set(gproj_, proj, 0, (size_t)p_.d_proj * N_ * 4);
+    }
     if (ggml_backend_graph_compute(m_.backend, g_) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("DitRunner: compute failed");
     std::vector<float> outv = tensor_to_f32(gout_);
@@ -143,8 +227,10 @@ DitRunner* make_sparse_runner(const Model& m, const DiTParams& p,
     return new DitRunner(m, p, (int)coords.size(), n_cond, rcos, rsin);
 }
 
-std::vector<float> sample_flow(const FlowFwd& fwd, std::vector<float> sample,
-                               const float* cond, const float* neg_cond, const SamplerParams& sp,
+std::vector<float> sample_flow(const FlowFwdProj& fwd, std::vector<float> sample,
+                               const float* cond, const float* neg_cond,
+                               const float* proj, const float* neg_proj,
+                               const SamplerParams& sp,
                                std::vector<std::vector<float>>* trace) {
     const float sm = sp.sigma_min;
     const size_t Nst = sample.size();
@@ -185,14 +271,14 @@ std::vector<float> sample_flow(const FlowFwd& fwd, std::vector<float> sample,
         const float gs = (sp.gi0 <= t && t <= sp.gi1) ? sp.guidance_strength : 1.0f;
         const float tscaled = 1000.0f * t;
         if (gs == 1.0f) {
-            pred = fwd(sample, tscaled, cond);
+            pred = fwd(sample, tscaled, cond, proj);
             ++n_fwd;
         } else if (gs == 0.0f) {
-            pred = fwd(sample, tscaled, neg_cond);
+            pred = fwd(sample, tscaled, neg_cond, neg_proj);
             ++n_fwd;
         } else {
-            pos = fwd(sample, tscaled, cond);
-            neg = fwd(sample, tscaled, neg_cond);
+            pos = fwd(sample, tscaled, cond, proj);
+            neg = fwd(sample, tscaled, neg_cond, neg_proj);
             n_fwd += 2;
             for (size_t k = 0; k < Nst; ++k) pred[k] = gs * pos[k] + (1 - gs) * neg[k];
             if (sp.guidance_rescale > 0.0f) {
@@ -229,6 +315,13 @@ std::vector<float> sample_flow(const FlowFwd& fwd, std::vector<float> sample,
            std::chrono::duration<double>(std::chrono::steady_clock::now() - tflow0).count());
     fflush(stdout);
     return sample;
+}
+
+std::vector<float> sample_flow(const FlowFwd& fwd, std::vector<float> sample,
+                               const float* cond, const float* neg_cond, const SamplerParams& sp,
+                               std::vector<std::vector<float>>* trace) {
+    FlowFwdProj f = [&fwd](const std::vector<float>& x, float t, const float* c, const float*) { return fwd(x, t, c); };
+    return sample_flow(f, std::move(sample), cond, neg_cond, nullptr, nullptr, sp, trace);
 }
 
 } // namespace trellis

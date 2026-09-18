@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 namespace trellis {
 
@@ -16,7 +17,23 @@ static bool g_cast_f32 = false;   // set per build_dit_dense call
 
 // Budget for one query chunk's [Lk, nq, nh] score tile in the exact (non-FA) SDPA path.
 // Bounds the peak regardless of Lq, which is what made FA necessary in the first place.
+// sdpa のクエリ分割 1 チャンクあたりのスコア行列の予算。分割数を変えても結果は同じ
+// （softmax はクエリ行ごとに閉じている）なので、これは純粋にメモリと速度の調整値。
+//
+// ブラウザだけ既定を下げる理由: WebGPU のデバイス予算は実測 4095 MB しかなく、
+// テクスチャ flow（N=17690, n_heads=12）の常駐は
+//   重み 2647 MB + 活性化 + conditioning 276 MB
+// なので、活性化を 1172 MB 以下に収めないと予算を超える。超えるとユニファイドメモリ上で
+// Metal がメモリを往復させ続け、1 forward が 40 秒から 139〜176 秒に伸びてマシン全体が
+// 巻き添えで固まる（2026-09-08 実測）。
+// 実測（native Metal, N=17690）: 1024 MB -> 活性化 1888 MB / 256 MB -> 1127 MB /
+// 128 MB -> 1032 MB（ここで attention 以外が支配的になり頭打ち）。128 MB なら
+// 合計 3956 MB で予算内に収まる。native は速度優先で 1024 MB のまま。
+#ifdef __EMSCRIPTEN__
+static constexpr int64_t kAttnChunkBytes = 128ll * 1024 * 1024;
+#else
 static constexpr int64_t kAttnChunkBytes = 1024ll * 1024 * 1024;
+#endif
 bool g_no_fa = false;             // --no-fa; set by trellis_run
 
 static T* lin(ggml_context* c, const Model& m, const std::string& p, T* x) {
@@ -46,8 +63,11 @@ static T* rms_gamma(ggml_context* c, T* x, T* gamma, float eps) {
 // output with two ggml_set_rows (single flat-grid dispatch each) rather than ggml_concat: ggml's
 // concat launches one kernel per ne[3] slice, so the old concat over the [2,half,nh,L] pair tensor
 // fired L (token-count) dispatches per call -> ~30M concat launches over a flow. q/k are F32 here
-// (mul_mat output), which ggml_set_rows requires. Even/odd row indices come from ggml_arange.
-static T* apply_rope(ggml_context* c, T* x, T* cos, T* sin) {
+// (mul_mat output), which ggml_set_rows requires. Even/odd row indices come from `rope_idx`
+// (host-built I32 [hd] = evens|odds, see dit_rope_index) when the caller supplies one, else
+// from ggml_arange -- identical integers either way; the input form exists because the ggml
+// WebGPU backend has no ARANGE kernel (docs/PIXAL3D_WEBGPU_OP_GAP.md C2).
+static T* apply_rope(ggml_context* c, T* x, T* cos, T* sin, T* rope_idx) {
     const int64_t hd = x->ne[0], nh = x->ne[1], L = x->ne[2];
     const int64_t half = hd / 2;
     T* x5 = ggml_reshape_4d(c, x, 2, half, nh, L);              // [2, half, nh, L]
@@ -55,8 +75,14 @@ static T* apply_rope(ggml_context* c, T* x, T* cos, T* sin) {
     T* x1 = ggml_cont(c, ggml_view_4d(c, x5, 1, half, nh, L, x5->nb[1], x5->nb[2], x5->nb[3], x5->nb[0])); // odd
     T* ev = ggml_sub(c, ggml_mul(c, x0, cos), ggml_mul(c, x1, sin));   // [1,half,nh,L] rotated even
     T* od = ggml_add(c, ggml_mul(c, x1, cos), ggml_mul(c, x0, sin));   // [1,half,nh,L] rotated odd
-    T* ce = ggml_cast(c, ggml_arange(c, 0.0f, (float)hd, 2.0f), GGML_TYPE_I32);  // [0,2,..,hd-2]
-    T* co = ggml_cast(c, ggml_arange(c, 1.0f, (float)hd, 2.0f), GGML_TYPE_I32);  // [1,3,..,hd-1]
+    T *ce, *co;
+    if (rope_idx) {
+        ce = ggml_view_1d(c, rope_idx, half, 0);                                       // [0,2,..,hd-2]
+        co = ggml_view_1d(c, rope_idx, half, (size_t)half * ggml_element_size(rope_idx)); // [1,3,..,hd-1]
+    } else {
+        ce = ggml_cast(c, ggml_arange(c, 0.0f, (float)hd, 2.0f), GGML_TYPE_I32);
+        co = ggml_cast(c, ggml_arange(c, 1.0f, (float)hd, 2.0f), GGML_TYPE_I32);
+    }
     T* out = ggml_scale(c, ggml_reshape_4d(c, x, 1, hd, nh, L), 0.0f);  // allocated [1,hd,nh,L] scratch
     out = ggml_set_rows(c, out, ev, ce);
     out = ggml_set_rows(c, out, od, co);
@@ -82,6 +108,87 @@ static T* build_pad_mask(ggml_context* c, int64_t Lk_real, int64_t Lq) {
     constexpr int64_t KQ_MASK_PAD = 64;   // llama.cpp's GGML_KQ_MASK_PAD; not exported by ggml
     const int64_t Lq_pad = ((Lq + KQ_MASK_PAD - 1) / KQ_MASK_PAD) * KQ_MASK_PAD;
     return ggml_repeat(c, colh, ggml_new_tensor_2d(c, GGML_TYPE_F16, Lk_pad, Lq_pad)); // [Lk_pad,Lq_pad] F16
+}
+
+// DiT ブロックの MLP（fc1 -> GELU -> fc2）をトークン方向に分割する。x: [d_model, N]。
+// 中間 [4*d_model, N] は N に比例する最大級の活性化で、tex flow (d_model=1536, N=17489) では
+// 24 KiB/token = 410 MiB になる。MLP はトークンごとに完全に独立（fc1/fc2 は列方向に独立、
+// GELU は要素ごと、トークンをまたぐ縮約が無い）なので、数学的には分割しても同値。
+//
+// ただし**ビット一致は保証されない**: 列数を変えると行列積のカーネル選択が変わる。Metal は
+// 列数 2〜8 で専用カーネル・9 以上で matrix-matrix 経路、WebGPU は列数 1 で別経路を選ぶ。
+// 末尾チャンクが小さいとこの分岐を踏む。docs/design/2026-09-09-texture-flow-mlp-chunking.md 参照。
+//
+// 既定は sdpa のクエリ分割と揃える（native 1024 MiB / wasm 128 MiB）。native 既定では
+// N が 4 万程度まで 1 チャンクのままなので、実質ブラウザ経路のための分割である。
+// 分割しても数値が変わらない最小のチャンク幅。これを下回ると行列積のカーネル選択が
+// 変わり、結果がビット一致しなくなる。実測（2026-09-09, Metal, f16, tex flow N=17489、
+// 分割前との max|d|）: 末尾 1 -> 6.15e-04 / 2 -> 5.81e-04 / 8 -> 8.89e-04 / 9 -> 0 /
+// 2180 -> 0。Metal は列数 2〜8 に専用カーネル、9 以上で matrix-matrix 経路を選ぶ
+// （thirdparty/ggml/src/ggml-metal/ggml-metal-ops.cpp:2057-2078, 2164-2167）。
+static constexpr int64_t kMinMlpChunkTokens = 9;
+
+static T* mlp_chunked(ggml_context* c, const Model& m, const std::string& pre, T* x) {
+    const int64_t d_model = x->ne[0], N = x->ne[1];
+    // 既定は分割しない。ブラウザ（WebGPU / NOFA 経路）では分割しても活性化バッファが
+    // 1 バイトも減らないことを実測で確認しているので、既定で有効にすると benefit 0 に
+    // 対してグラフだけが変わる。実測（N=12083 / 17489、attn 8〜1024 MiB × MLP 32〜1024
+    // MiB のすべての組で 705.1 / 1020.5 MiB から動かない）。効くのは FlashAttention 経路
+    // だけで、そこでは N=17489 で 1850.9 -> 1663.1 MiB。診断・native 最適化用の opt-in と
+    // して置く。docs/design/2026-09-09-texture-flow-mlp-chunking.md 参照。
+    const char* env_mb  = getenv("TRELLIS_MLP_CHUNK_MB");
+    const char* env_tok = getenv("TRELLIS_MLP_CHUNK_TOKENS");
+    int64_t nt = N;                                             // = 分割しない
+    if (env_mb) {
+        const int64_t budget = std::max<int64_t>(1, atoll(env_mb)) * 1024 * 1024;
+        const int64_t per_token = 4 * d_model * 4;              // 中間 [4*d_model, 1] の f32 バイト数
+        nt = std::max<int64_t>(1, budget / std::max<int64_t>(per_token, 1));
+        // sdpa と同じ理由でチャンク数に上限を置く（1 チャンク約 8 ノード、30 ブロックが 1 グラフ）。
+        // atoll は 0 や負値も返すので clamp する（そのまま割ると 0 除算になる）。
+        static const int64_t kMaxMlpChunks = []() -> int64_t {
+            if (const char* e = getenv("TRELLIS_MLP_MAX_CHUNKS")) return std::max<int64_t>(1, atoll(e));
+            return 256;
+        }();
+        if (nt * kMaxMlpChunks < N) nt = (N + kMaxMlpChunks - 1) / kMaxMlpChunks;
+        if (nt < N) {                                           // チャンク幅を均す
+            const int64_t k = (N + nt - 1) / nt;
+            nt = (N + k - 1) / k;
+            if (N >= kMinMlpChunkTokens) nt = std::max(nt, kMinMlpChunkTokens);
+        }
+    }
+    // 検証用のみ: チャンク幅をトークン数で直接指定し、均し処理も下限も迂回する。
+    // 末尾を狙って 1 / 2 / 8 / 9 トークンにしてカーネル分岐を再現するために使う
+    // （＝意図的にビット不一致を作れる）。無言で挙動が変わらないよう一度だけログに出す。
+    if (env_tok) {
+        nt = std::max<int64_t>(1, atoll(env_tok));
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "[dit] TRELLIS_MLP_CHUNK_TOKENS=%s -- 検証専用。チャンク幅の均しと "
+                            "最小幅 %lld を迂回するので、結果が分割前とビット一致しなくなりうる\n",
+                    env_tok, (long long)kMinMlpChunkTokens);
+        }
+    }
+    if (nt >= N) {                                              // 1 チャンク: 分割前と同じグラフ
+        T* y = lin(c, m, pre + ".0", x);
+        y = ggml_gelu(c, y);                                    // GELU(approximate=tanh)
+        return lin(c, m, pre + ".2", y);
+    }
+    T* out = nullptr;
+    for (int64_t t0 = 0; t0 < N; ) {
+        int64_t n = std::min(nt, N - t0);
+        // 均しだけでは末尾が最小幅を割ることがある（総当たりで N=1436 / 1 MiB -> 末尾 8 など
+        // 8820 組）。ceil(N/k) は既に不動点なので均しを繰り返しても消えない。残りが最小幅に
+        // 満たないならこのチャンクに吸収して、どのチャンクも下限を割らないようにする。
+        if (!env_tok && N - t0 - n > 0 && N - t0 - n < kMinMlpChunkTokens) n = N - t0;
+        T* xc = ggml_cont(c, ggml_view_2d(c, x, d_model, n, x->nb[1], (size_t)t0 * x->nb[1]));
+        T* y = lin(c, m, pre + ".0", xc);                       // [4*d_model, n]
+        y = ggml_gelu(c, y);
+        y = lin(c, m, pre + ".2", y);                           // [d_model, n]
+        out = out ? ggml_concat(c, out, y, 1) : y;
+        t0 += n;
+    }
+    return out;                                                 // [d_model, N]
 }
 
 // SDPA over heads. q:[hd,nh,Lq]  k,v:[hd,nh,Lk] -> [d_model, Lq].  `mask`: optional [Lk_pad,Lq] F16.
@@ -199,14 +306,26 @@ static T* sdpa(ggml_context* c, T* q, T* k, T* v, int d_model, T* mask = nullptr
     const int64_t hd = q2->ne[0], Lq = q2->ne[1], nh = q2->ne[2], Lk = k2->ne[1];
 
     int64_t budget = kAttnChunkBytes;
-    if (const char* e = getenv("TRELLIS_ATTN_CHUNK_MB")) budget = atoll(e) * 1024 * 1024;
+    if (const char* e = getenv("TRELLIS_ATTN_CHUNK_MB")) budget = std::max<int64_t>(1, atoll(e)) * 1024 * 1024;
     const int64_t per_q = Lk * nh * 4;                          // one query's score column
     int64_t nq = std::max<int64_t>(1, budget / std::max<int64_t>(per_q, 1));
     // Floor on the chunk size: each chunk adds ~8 nodes and a whole 30-block DiT with two
     // attentions per block is built as ONE graph, so an unbounded chunk count exhausts the
     // ggml context (ggml_new_object: not enough space). Hitting this cap costs memory, not
     // correctness -- query chunking is bit-exact either way (no reduction crosses queries).
-    constexpr int64_t kMaxAttnChunks = 32;
+    // 上限は「1 グラフに入るテンソル数」から来る制約で、正しさとは無関係（クエリ分割は
+    // どちらでもビット完全）。ブラウザでは活性化バッファが WebGPU の予算に収まるかどうかが
+    // 死活問題なので、flow_runner.cpp のメタデータ枠を広げたうえでここも上げてある。
+    // 実測（tex flow, N=17690, n_heads=12）: 上限 32 だと 1 チャンク 553 クエリ =
+    // スコア 470 MB で頭打ちになり、活性化バッファは 1316 MB より下がらなかった。
+    // 戻り型は明示する。atoll() は long long、(int64_t)256 は Linux/GCC では long なので
+    // 推論に任せると "inconsistent types deduced for lambda return type" で落ちる（macOS
+    // clang は int64_t が long long なので通ってしまい、Linux ビルドでだけ露見する）。
+    static const int64_t kMaxAttnChunks = []() -> int64_t {
+        // atoll は 0 や負値も返す。そのまま割ると 0 除算になるので clamp する。
+        if (const char* e = getenv("TRELLIS_ATTN_MAX_CHUNKS")) return std::max<int64_t>(1, atoll(e));
+        return 256;
+    }();
     if (nq * kMaxAttnChunks < Lq) nq = (Lq + kMaxAttnChunks - 1) / kMaxAttnChunks;
     if (nq >= Lq) nq = Lq;                                      // small attn: single chunk, no concat
 
@@ -231,7 +350,7 @@ static T* gamma32(ggml_context* c, const Model& m, const std::string& key) {
 }
 
 static T* self_attn(ggml_context* c, const Model& m, const std::string& pre, T* h,
-                    T* cos, T* sin, const DiTParams& p, T* mask = nullptr) {
+                    T* cos, T* sin, const DiTParams& p, T* mask = nullptr, T* rope_idx = nullptr) {
     const int hd = p.head_dim, nh = p.n_heads;
     const int64_t L = h->ne[1];
     T* qkv = lin(c, m, pre + ".to_qkv", h);                     // [3*d_model, L]
@@ -243,8 +362,8 @@ static T* self_attn(ggml_context* c, const Model& m, const std::string& pre, T* 
     T* q = pick(0); T* k = pick(1); T* v = pick(2);
     q = rms_gamma(c, q, gamma32(c, m, pre + ".q_rms_norm.gamma"), p.rms_eps);
     k = rms_gamma(c, k, gamma32(c, m, pre + ".k_rms_norm.gamma"), p.rms_eps);
-    q = apply_rope(c, q, cos, sin);
-    k = apply_rope(c, k, cos, sin);
+    q = apply_rope(c, q, cos, sin, rope_idx);
+    k = apply_rope(c, k, cos, sin, rope_idx);
     return lin(c, m, pre + ".to_out", sdpa(c, q, k, v, p.d_model, mask));
 }
 
@@ -273,10 +392,18 @@ static T* modulate(ggml_context* c, T* x, T* scale, T* shift) {
 
 static T* block(ggml_context* c, const Model& m, int i, T* h, T* mod, T* cond,
                 T* cos, T* sin, const DiTParams& p, std::map<std::string, T*>* inter = nullptr,
-                T* self_mask = nullptr, T* cross_mask = nullptr) {
+                T* self_mask = nullptr, T* cross_mask = nullptr, T* proj = nullptr,
+                T* rope_idx = nullptr) {
     const std::string b = "blocks." + std::to_string(i);
     const int dm = p.d_model;
-    auto dbg = [&](const char* n, T* t) { if (inter && i == 0) { (*inter)[n] = t; ggml_set_name(t, n); } return t; };
+    // Block 0 keeps the historical "blk0_*" names; block 15 is exposed too as a mid-depth probe.
+    auto dbg = [&](const char* n, T* t) {
+        if (inter && (i == 0 || i == 15)) {
+            std::string nm = i == 0 ? std::string(n) : "blk15_" + std::string(n + 5);
+            (*inter)[nm] = t; ggml_set_name(t, nm.c_str());
+        }
+        return t;
+    };
     T* mb = ggml_add(c, m.get(b + ".modulation"), mod);        // [6*d_model]
     auto ch = [&](int j) { return ggml_view_1d(c, mb, dm, (size_t)j * dm * ggml_element_size(mb)); };
     T* shift_msa = ch(0), *scale_msa = ch(1), *gate_msa = ch(2);
@@ -284,28 +411,51 @@ static T* block(ggml_context* c, const Model& m, int i, T* h, T* mod, T* cond,
 
     T* hh = layernorm(c, h, p.ln_eps);
     hh = modulate(c, hh, scale_msa, shift_msa);
-    hh = self_attn(c, m, b + ".self_attn", hh, cos, sin, p, self_mask);
+    hh = self_attn(c, m, b + ".self_attn", hh, cos, sin, p, self_mask, rope_idx);
     dbg("blk0_msa", hh);
     h = ggml_add(c, h, ggml_mul(c, hh, gate_msa));
 
     hh = layernorm(c, h, p.ln_eps, m.get(b + ".norm2.weight"), m.get(b + ".norm2.bias"));
-    hh = cross_attn(c, m, b + ".cross_attn", hh, cond, p, cross_mask);
-    dbg("blk0_cross", hh);
+    // Pixal3D ProjectAttention: the ordinary cross-attn weights move one level deeper
+    // (blocks.N.cross_attn.cross_attn_block.*) alongside a sibling proj_linear.
+    const std::string cross_pre = p.proj_attn ? (b + ".cross_attn.cross_attn_block") : (b + ".cross_attn");
+    T* global_out = cross_attn(c, m, cross_pre, hh, cond, p, cross_mask);
+    dbg("blk0_global_out", global_out);
+    hh = global_out;
+    if (p.proj_attn && proj) {
+        T* proj_out = lin(c, m, b + ".cross_attn.proj_linear", proj);
+        dbg("blk0_proj_out", proj_out);
+        hh = ggml_add(c, hh, proj_out);
+    }
+    dbg("blk0_cross_out", hh);
+    dbg("blk0_cross", hh);   // kept for TRELLIS_DBG_NAN's existing name lookup
     h = ggml_add(c, h, hh);
 
     hh = layernorm(c, h, p.ln_eps);
     hh = modulate(c, hh, scale_mlp, shift_mlp);
-    hh = lin(c, m, b + ".mlp.mlp.0", hh);
-    hh = ggml_gelu(c, hh);                                      // GELU(approximate=tanh)
-    hh = lin(c, m, b + ".mlp.mlp.2", hh);
+    hh = mlp_chunked(c, m, b + ".mlp.mlp", hh);
     dbg("blk0_mlp", hh);
     h = ggml_add(c, h, ggml_mul(c, hh, gate_mlp));
     return h;
 }
 
+bool dit_detect_proj_attn(const Model& m, DiTParams& p) {
+    T* w = m.try_get("blocks.0.cross_attn.proj_linear.weight");
+    if (!w) { p.proj_attn = false; p.d_proj = 0; return false; }
+    p.proj_attn = true;
+    p.d_proj = (int)w->ne[0];
+    return true;
+}
+
+void dit_rope_index(int head_dim, std::vector<int32_t>& out) {
+    out.resize(head_dim);
+    const int half = head_dim / 2;
+    for (int i = 0; i < half; ++i) { out[i] = 2 * i; out[half + i] = 2 * i + 1; }
+}
+
 ggml_tensor* build_dit_dense(ggml_context* c, const Model& m, const DiTParams& p,
                              T* h0, T* tfreq, T* cond, T* cos, T* sin,
-                             std::map<std::string, T*>* inter) {
+                             std::map<std::string, T*>* inter, T* proj, T* rope_idx) {
     g_cast_f32 = p.cast_f32;
     auto keep = [&](const char* n, T* t) { if (inter) (*inter)[n] = t; ggml_set_name(t, n); return t; };
 
@@ -322,10 +472,8 @@ ggml_tensor* build_dit_dense(ggml_context* c, const Model& m, const DiTParams& p
     // That becomes a 2.75 GB single tensor at 37,017 tokens. sdpa() now creates an identical
     // mask per QUERY CHUNK, so there is deliberately no full-flow mask tensor here.
     for (int i = 0; i < p.n_blocks; ++i) {
-        h = block(c, m, i, h, mod, cond, cos, sin, p, inter, nullptr, nullptr);
-        if (i == 0) keep("after_block0", h);
-        if (i == 1) keep("after_block1", h);
-        if (i == p.n_blocks - 1) keep("after_block29", h);
+        h = block(c, m, i, h, mod, cond, cos, sin, p, inter, nullptr, nullptr, proj, rope_idx);
+        keep(("after_block" + std::to_string(i)).c_str(), h);
     }
     h = layernorm(c, h, p.final_ln_eps);
     keep("prefinal", h);
