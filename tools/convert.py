@@ -86,7 +86,7 @@ def keep_f32(name):
     return name.endswith(EMBED_TOKEN_SUFFIXES) or ".cls_token" in name or ".reg_token" in name
 
 
-def read_safetensors(path):
+def read_safetensors(path, skip_names=()):
     """Yield (name, numpy_f32_or_f16_array) preserving natural (torch) shape."""
     with open(path, "rb") as fh:
         n = struct.unpack("<Q", fh.read(8))[0]
@@ -94,6 +94,8 @@ def read_safetensors(path):
         base = 8 + n
         items = [(k, v) for k, v in hdr.items() if k != "__metadata__"]
         for name, v in items:
+            if name in skip_names:
+                continue
             dt = v["dtype"]; shape = v["shape"]
             o0, o1 = v["data_offsets"]
             fh.seek(base + o0)
@@ -185,7 +187,9 @@ def convert(component):
         print(f"  {component:14s} -> {os.path.basename(dst):22s} {total:4d} tensors (f16={n_f16}, f32={n_f32})  {sz/1e9:.2f} GB")
         return
 
-    for name, arr in read_safetensors(src):
+    # Dense RoPE phases are regenerated from coordinates by make_dense_runner.
+    skip_names = {"rope_phases"} if component == "ss_flow" else set()
+    for name, arr in read_safetensors(src, skip_names):
         # ggml is max 4-D. Two distinct 5-D conv layouts:
         if arr.ndim == 5:
             if sparse_conv:
