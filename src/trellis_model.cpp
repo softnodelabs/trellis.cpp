@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -132,40 +133,48 @@ Model Model::load(const std::string& path, int gpu) {
     if (!m.gguf) throw std::runtime_error("failed to open gguf: " + path);
     m.meta = meta;
 
-    // metadata
-    if (int64_t k = gguf_find_key(m.gguf, "general.architecture"); k >= 0)
-        m.arch = gguf_get_val_str(m.gguf, k);
-    if (int64_t k = gguf_find_key(m.gguf, "trellis.config_json"); k >= 0)
-        m.config_json = gguf_get_val_str(m.gguf, k);
+    // Everything below can throw while the header, the backend and the weight buffer are held,
+    // and a Model has no destructor. Release them here, or a failed load - a truncated file, a
+    // failed allocation - keeps a full-size device buffer for the life of the process.
+    try {
+        // metadata
+        if (int64_t k = gguf_find_key(m.gguf, "general.architecture"); k >= 0)
+            m.arch = gguf_get_val_str(m.gguf, k);
+        if (int64_t k = gguf_find_key(m.gguf, "trellis.config_json"); k >= 0)
+            m.config_json = gguf_get_val_str(m.gguf, k);
 
-    m.backend = make_backend(gpu);
-    m.on_gpu  = gpu >= 0;
+        m.backend = make_backend(gpu);
+        m.on_gpu  = gpu >= 0;
 
-    // allocate one buffer for every tensor declared in the file
-    m.buffer = ggml_backend_alloc_ctx_tensors(meta, m.backend);
-    if (!m.buffer) throw std::runtime_error("failed to allocate tensor buffer for " + path);
+        // allocate one buffer for every tensor declared in the file
+        m.buffer = ggml_backend_alloc_ctx_tensors(meta, m.backend);
+        if (!m.buffer) throw std::runtime_error("failed to allocate tensor buffer for " + path);
 
-    // stream weights from disk into the backend buffer
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) throw std::runtime_error("cannot reopen gguf: " + path);
-    const size_t data_off = gguf_get_data_offset(m.gguf);
-    std::vector<uint8_t> staging;
-    const int64_t n = gguf_get_n_tensors(m.gguf);
-    for (int64_t i = 0; i < n; ++i) {
-        const char* name = gguf_get_tensor_name(m.gguf, i);
-        ggml_tensor* t = ggml_get_tensor(meta, name);
-        const size_t nbytes = ggml_nbytes(t);
-        const size_t off = data_off + gguf_get_tensor_offset(m.gguf, i);
-        staging.resize(nbytes);
-        if (trellis_fseek64(f, (int64_t)off, SEEK_SET) != 0 ||
-            fread(staging.data(), 1, nbytes, f) != nbytes) {
-            fclose(f);
-            throw std::runtime_error(std::string("short read for tensor ") + name);
+        // stream weights from disk into the backend buffer
+        // Closed on every way out, a throw from the loop included.
+        std::unique_ptr<FILE, int (*)(FILE*)> file(fopen(path.c_str(), "rb"), &fclose);
+        FILE* f = file.get();
+        if (!f) throw std::runtime_error("cannot reopen gguf: " + path);
+        const size_t data_off = gguf_get_data_offset(m.gguf);
+        std::vector<uint8_t> staging;
+        const int64_t n = gguf_get_n_tensors(m.gguf);
+        for (int64_t i = 0; i < n; ++i) {
+            const char* name = gguf_get_tensor_name(m.gguf, i);
+            ggml_tensor* t = ggml_get_tensor(meta, name);
+            const size_t nbytes = ggml_nbytes(t);
+            const size_t off = data_off + gguf_get_tensor_offset(m.gguf, i);
+            staging.resize(nbytes);
+            if (trellis_fseek64(f, (int64_t)off, SEEK_SET) != 0 ||
+                fread(staging.data(), 1, nbytes, f) != nbytes) {
+                throw std::runtime_error(std::string("short read for tensor ") + name);
+            }
+            ggml_backend_tensor_set(t, staging.data(), 0, nbytes);
+            m.tensors[name] = t;
         }
-        ggml_backend_tensor_set(t, staging.data(), 0, nbytes);
-        m.tensors[name] = t;
+    } catch (...) {
+        m.free();
+        throw;
     }
-    fclose(f);
     return m;
 }
 
