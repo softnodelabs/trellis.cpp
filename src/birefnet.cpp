@@ -1,6 +1,8 @@
-// BiRefNet Swin-L backbone in GGML. Segmented per-stage graphs; window partition / shifted-window
-// roll / attention mask are precomputed on the host as gather/scatter index arrays + an additive
-// mask, applied via ggml_get_rows. Validated against tools/ref_birefnet.py dumps.
+// BiRefNet (Swin-L backbone + ASPPDeformable decoder) in GGML. The backbone runs as one graph per
+// input scale; window partition / shifted-window roll / attention mask are precomputed on the host
+// as gather/scatter index arrays + an additive mask, applied via ggml_get_rows. Each decoder block
+// runs as two graphs around its deformable convolutions, the one step done by a custom kernel.
+// Validated against tools/ref_birefnet.py dumps.
 #include "birefnet.h"
 #include "deform_conv.h"
 #include "trellis_model.h"
@@ -15,6 +17,8 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <functional>
+#include <cstdio>
 
 namespace trellis {
 using T = ggml_tensor;
@@ -107,206 +111,153 @@ static WinIdx build_winidx(int H, int W, int shift) {
     return wi;
 }
 
-// one Swin block as its OWN graph (host [C,N] -> host [C,N]) to bound per-graph memory. smask_host =
-// soft_max_ext additive mask: non-shifted -> rel-pos bias [ws2,ws2,NH] (broadcast); shifted -> full
-// bias+shiftmask [ws2,ws2,NH,nW].
-static std::vector<float> swin_block_run(const Model& m, const std::string& p,
-        const std::vector<float>& xin, int C, int N, int NH, const WinIdx& wi, bool shifted,
-        const std::vector<float>& smask_host) {
-    const int ws2 = WS * WS, HD = C / NH, Mwin = wi.nW * ws2;
+// Everything a stage's graph needs from the host, for one token grid.
+struct StageIdx {
+    int H = 0, W = 0, N = 0, nW[2] = {0, 0};
+    std::vector<int32_t> gather[2], scatter[2];   // [0] unshifted, [1] shifted; a pad slot gathers token 0
+    std::vector<float>   keep[2];                 // [nW*ws2] 1 for a real token, 0 for a pad slot
+    std::vector<float>   shift;                   // [ws2(k), ws2(q), 1, nW] additive shifted-window mask
+    std::vector<int32_t> merge[4];                // PatchMerging's four 2x2 gathers
+};
+
+static StageIdx stage_idx(int H, int W) {
+    StageIdx si; si.H = H; si.W = W; si.N = H * W;
+    for (int sh = 0; sh < 2; ++sh) {
+        WinIdx wi = build_winidx(H, W, sh ? WS / 2 : 0);
+        si.nW[sh] = wi.nW;
+        si.keep[sh].resize(wi.gather.size());
+        for (size_t i = 0; i < wi.gather.size(); ++i) {
+            const bool pad = wi.gather[i] == wi.N;
+            si.keep[sh][i] = pad ? 0.0f : 1.0f;
+            if (pad) wi.gather[i] = 0;
+        }
+        si.gather[sh] = std::move(wi.gather);
+        si.scatter[sh] = std::move(wi.scatter);
+        if (sh) si.shift = std::move(wi.mask);
+    }
+    const int Hh = H / 2, Wh = W / 2;
+    for (int q = 0; q < 4; ++q) si.merge[q].resize((size_t)Hh * Wh);
+    for (int hr = 0; hr < Hh; ++hr) for (int wr = 0; wr < Wh; ++wr) {
+        const int np = hr * Wh + wr;
+        si.merge[0][np] = (2*hr)*W + (2*wr);   si.merge[1][np] = (2*hr+1)*W + (2*wr);
+        si.merge[2][np] = (2*hr)*W + (2*wr+1); si.merge[3][np] = (2*hr+1)*W + (2*wr+1);
+    }
+    return si;
+}
+
+// One Swin block, [C,N] -> [C,N], inside the backbone's graph. `mask` is soft_max_ext's additive
+// mask: the relative-position bias [ws2,ws2,NH] alone for an unshifted block, broadcast over the
+// windows, or bias + shift mask [ws2,ws2,NH,nW] for a shifted one.
+static T* swin_block(ggml_context* c, const Model& m, const std::string& p, T* x, int C, int NH, int nW,
+                     T* gather, T* keep, T* scatter, T* mask) {
+    const int ws2 = WS * WS, HD = C / NH, Mwin = nW * ws2;
     const float scale = 1.0f / std::sqrt((float)HD);
-    // host-pad: append a zero column so gather's pad-index (=N) reads zeros. (Avoid ggml_pad: its
-    // CUDA kernel launches a grid dim = ne1 = N+1, which exceeds the 65535 limit at stage 0 -> the
-    // whole window attention runs in ONE GPU graph per block.)
-    std::vector<float> xpad((size_t)C * (N + 1), 0.0f);
-    std::memcpy(xpad.data(), xin.data(), (size_t)C * N * sizeof(float));
-    std::vector<float> cmaskd(N + 1, 1.0f); cmaskd[N] = 0.0f;       // zero the pad column post-norm
-    ggml_context* c = mkctx();
-    T* x  = ggml_new_tensor_2d(c, GGML_TYPE_F32, C, N + 1);       ggml_set_input(x);
-    T* xb = ggml_new_tensor_2d(c, GGML_TYPE_F32, C, N);           ggml_set_input(xb);   // residual (unpadded)
-    T* cmask = ggml_new_tensor_2d(c, GGML_TYPE_F32, 1, N + 1);    ggml_set_input(cmask);
-    T* gi = ggml_new_tensor_1d(c, GGML_TYPE_I32, Mwin);           ggml_set_input(gi);
-    T* si = ggml_new_tensor_1d(c, GGML_TYPE_I32, N);              ggml_set_input(si);
-    T* sm = shifted ? ggml_new_tensor_4d(c, GGML_TYPE_F32, ws2, ws2, NH, wi.nW)
-                    : ggml_new_tensor_3d(c, GGML_TYPE_F32, ws2, ws2, NH);  ggml_set_input(sm);
-    T* h = ln(c, x, m.get(p + ".norm1.weight"), m.get(p + ".norm1.bias"));  // LN over the padded [C,N+1]
-    h = ggml_mul(c, h, cmask);                                      // norm1 THEN pad-zero (matches ref order)
-    h = ggml_get_rows(c, h, gi);                                    // [C, Mwin] (gathers real + zero-pad cols)
+    T* h = ln(c, x, m.get(p + ".norm1.weight"), m.get(p + ".norm1.bias"));
+    h = ggml_get_rows(c, h, gather);                                // [C, Mwin]
+    h = ggml_mul(c, h, keep);                                       // pad slots -> zero tokens
     T* qkv = lin(c, m, p + ".attn.qkv", h);                         // [3C, Mwin]
     T* q = ggml_view_2d(c, qkv, C, Mwin, qkv->nb[1], 0);
     T* k = ggml_view_2d(c, qkv, C, Mwin, qkv->nb[1], (size_t)C * ggml_element_size(qkv));
     T* v = ggml_view_2d(c, qkv, C, Mwin, qkv->nb[1], (size_t)2 * C * ggml_element_size(qkv));
     auto heads = [&](T* t) {
         t = ggml_cont(c, t);
-        t = ggml_reshape_4d(c, t, HD, NH, ws2, wi.nW);
+        t = ggml_reshape_4d(c, t, HD, NH, ws2, nW);
         t = ggml_cont(c, ggml_permute(c, t, 0, 2, 1, 3));
-        return ggml_reshape_3d(c, t, HD, ws2, NH * wi.nW);
+        return ggml_reshape_3d(c, t, HD, ws2, NH * nW);
     };
     q = heads(q); k = heads(k); v = heads(v);
     T* kq = ggml_mul_mat(c, k, q);                                  // [ws2(k), ws2(q), NH*nW]
-    kq = ggml_reshape_4d(c, kq, ws2, ws2, NH, wi.nW);
-    kq = ggml_soft_max_ext(c, kq, sm, scale, 0.0f);                 // softmax(kq*scale + mask)
-    kq = ggml_reshape_3d(c, kq, ws2, ws2, NH * wi.nW);
+    kq = ggml_reshape_4d(c, kq, ws2, ws2, NH, nW);
+    kq = ggml_soft_max_ext(c, kq, mask, scale, 0.0f);
+    kq = ggml_reshape_3d(c, kq, ws2, ws2, NH * nW);
     T* vt = ggml_cont(c, ggml_permute(c, v, 1, 0, 2, 3));           // [ws2(k), HD, NH*nW]
     T* o = ggml_mul_mat(c, vt, kq);                                 // [HD, ws2(q), NH*nW]
-    o = ggml_reshape_4d(c, o, HD, ws2, NH, wi.nW);
+    o = ggml_reshape_4d(c, o, HD, ws2, NH, nW);
     o = ggml_cont(c, ggml_permute(c, o, 0, 2, 1, 3));
     o = ggml_reshape_2d(c, o, C, Mwin);
     o = lin(c, m, p + ".attn.proj", o);
-    o = ggml_get_rows(c, o, si);                                    // scatter -> [C, N]
-    T* xr = ggml_add(c, xb, o);                                     // residual
+    o = ggml_get_rows(c, o, scatter);                               // [C, N]
+    T* xr = ggml_add(c, x, o);
     T* h2 = ln(c, xr, m.get(p + ".norm2.weight"), m.get(p + ".norm2.bias"));
     h2 = lin(c, m, p + ".mlp.fc1", h2);
     h2 = ggml_gelu_erf(c, h2);
     h2 = lin(c, m, p + ".mlp.fc2", h2);
-    T* outp = ggml_add(c, xr, h2);
-    std::vector<float> r = run_graph(m, c, {outp},
-        { {x, xpad.data()}, {xb, xin.data()}, {cmask, cmaskd.data()}, {gi, wi.gather.data()},
-          {si, wi.scatter.data()}, {sm, smask_host.data()} })[0];
-    ggml_free(c);
-    return r;
+    return ggml_add(c, xr, h2);
 }
 
+// The whole backbone at one scale as a single graph: patch embed, the four stages and their
+// PatchMerging, with the tokens never leaving the device. The window bookkeeping comes from
+// stage_idx and the relative-position bias is gathered on the device from the model's own table
+// and index tensors. Each stage's normalized output is read back already in torch [C,H,W] order.
 BBOut swin_backbone(const Model& m, const std::vector<float>& chw, int S) {
-    BBOut out;
-    std::vector<float> tok; int C, H, W;
-    {   // patch embed: conv4x4 s4 -> [C,N] -> LN
-        ggml_context* c = mkctx();
-        T* img = ggml_new_tensor_4d(c, GGML_TYPE_F32, S, S, 3, 1); ggml_set_input(img);
-        T* pe = ggml_conv_2d(c, m.get("bb.patch_embed.proj.weight"), img, 4, 4, 0, 0, 1, 1);  // [W,H,192]
-        pe = ggml_add(c, pe, ggml_reshape_3d(c, m.get("bb.patch_embed.proj.bias"), 1, 1, 192));
-        int Wp = S / 4, Hp = S / 4;
-        T* tc = ggml_cont(c, ggml_permute(c, pe, 1, 2, 0, 3));       // [192, W, H]
-        T* t = ggml_reshape_2d(c, tc, 192, Wp * Hp);                 // [192, N]
-        t = ln(c, t, m.get("bb.patch_embed.norm.weight"), m.get("bb.patch_embed.norm.bias"));
-        (void)tc;
-        tok = run_graph(m, c, {t}, { {img, chw.data()} })[0];
-        ggml_free(c);
-        C = 192; H = Hp; W = Wp;
-    }
+    const int ws2 = WS * WS;
+    ggml_context* c = mkctx();
+    std::vector<std::pair<T*, const void*>> ins;
+    auto input = [&](T* t, const void* data) { ggml_set_input(t); ins.push_back({t, data}); return t; };
 
+    T* img = input(ggml_new_tensor_4d(c, GGML_TYPE_F32, S, S, 3, 1), chw.data());
+    T* pe = ggml_conv_2d(c, m.get("bb.patch_embed.proj.weight"), img, 4, 4, 0, 0, 1, 1);   // [W,H,192]
+    pe = ggml_add(c, pe, ggml_reshape_3d(c, m.get("bb.patch_embed.proj.bias"), 1, 1, 192));
+    int C = 192, H = S / 4, W = S / 4;
+    T* tok = ggml_reshape_2d(c, ggml_cont(c, ggml_permute(c, pe, 1, 2, 0, 3)), C, W * H);  // [192, N]
+    tok = ln(c, tok, m.get("bb.patch_embed.norm.weight"), m.get("bb.patch_embed.norm.bias"));
+
+    BBOut out;
+    T* outs[4];
+    StageIdx idx[4];                     // host buffers the graph uploads; they live until it has run
     for (int s = 0; s < 4; ++s) {
-        const int NH = HEADS[s], N = H * W, ws2 = WS * WS;
-        WinIdx wi0 = build_winidx(H, W, 0), wi1 = build_winidx(H, W, WS / 2);
-        std::string p0 = "bb.layers." + std::to_string(s) + ".blocks.";
-        std::vector<int32_t> idx((size_t)ws2 * ws2);
-        ggml_backend_tensor_get(m.get(p0 + "0.attn.relative_position_index"), idx.data(), 0,
-                                ggml_nbytes(m.get(p0 + "0.attn.relative_position_index")));
-        // each block: own graph, host [C,N] in/out
+        const int NH = HEADS[s];
+        idx[s] = stage_idx(H, W);
+        const StageIdx& si = idx[s];
+        const std::string p0 = "bb.layers." + std::to_string(s) + ".blocks.";
+        T* gather[2]; T* keep[2]; T* scatter[2];
+        for (int sh = 0; sh < 2; ++sh) {
+            const int Mwin = si.nW[sh] * ws2;
+            gather[sh]  = input(ggml_new_tensor_1d(c, GGML_TYPE_I32, Mwin), si.gather[sh].data());
+            keep[sh]    = input(ggml_new_tensor_2d(c, GGML_TYPE_F32, 1, Mwin), si.keep[sh].data());
+            scatter[sh] = input(ggml_new_tensor_1d(c, GGML_TYPE_I32, si.N), si.scatter[sh].data());
+        }
+        T* shift = input(ggml_new_tensor_4d(c, GGML_TYPE_F32, ws2, ws2, 1, si.nW[1]), si.shift.data());
+        T* rel_index = ggml_reshape_1d(c, m.get(p0 + "0.attn.relative_position_index"), ws2 * ws2);  // k + ws2*q
         for (int b = 0; b < DEPTH[s]; ++b) {
-            bool sh = (b % 2) == 1;
-            std::vector<float> tab = tensor_to_f32(m.get(p0 + std::to_string(b) + ".attn.relative_position_bias_table"));
-            std::vector<float> bias((size_t)ws2 * ws2 * NH);   // [k,q,h]
-            for (int hh = 0; hh < NH; ++hh) for (int q = 0; q < ws2; ++q) for (int k = 0; k < ws2; ++k)
-                bias[(size_t)k + ws2*(q + (size_t)ws2*hh)] = tab[(size_t)hh + (size_t)NH*idx[(size_t)q*ws2 + k]];
-            std::vector<float> smask;
-            if (!sh) smask = std::move(bias);
-            else {   // bias[k,q,h] + shiftmask[k,q,w] -> full [k,q,h,w]
-                smask.resize((size_t)ws2 * ws2 * NH * wi1.nW);
-                for (int w = 0; w < wi1.nW; ++w) for (int hh = 0; hh < NH; ++hh)
-                    for (int q = 0; q < ws2; ++q) for (int k = 0; k < ws2; ++k)
-                        smask[(size_t)k + ws2*(q + (size_t)ws2*(hh + (size_t)NH*w))] =
-                            bias[(size_t)k + ws2*(q + (size_t)ws2*hh)] +
-                            wi1.mask[(size_t)k + ws2*(q + (size_t)ws2*w)];
+            const std::string p = p0 + std::to_string(b);
+            const int sh = b % 2;
+            // bias[k,q,h] = table[h, index[k,q]]
+            T* bias = ggml_get_rows(c, m.get(p + ".attn.relative_position_bias_table"), rel_index);  // [NH, k + ws2*q]
+            bias = ggml_reshape_3d(c, bias, NH, ws2, ws2);                                           // [NH, k, q]
+            bias = ggml_cont(c, ggml_permute(c, bias, 2, 0, 1, 3));                                  // [k, q, NH]
+            T* mask = bias;
+            if (sh) {
+                T* shape = ggml_new_tensor_4d(c, GGML_TYPE_F32, ws2, ws2, NH, si.nW[1]);
+                mask = ggml_add(c, ggml_repeat(c, bias, shape), shift);
             }
-            tok = swin_block_run(m, p0 + std::to_string(b), tok, C, N, NH, sh ? wi1 : wi0, sh, smask);
+            tok = swin_block(c, m, p, tok, C, NH, si.nW[sh], gather[sh], keep[sh], scatter[sh], mask);
         }
-        // norm{s}(tok) -> out{s}; and PatchMerging(tok) -> next stage input
-        std::vector<float> xout;
-        {   // final per-stage LayerNorm
-            ggml_context* c = mkctx();
-            T* x = ggml_new_tensor_2d(c, GGML_TYPE_F32, C, N); ggml_set_input(x);
-            T* xo = ln(c, x, m.get("bb.norm" + std::to_string(s) + ".weight"), m.get("bb.norm" + std::to_string(s) + ".bias"));
-            xout = run_graph(m, c, {xo}, { {x, tok.data()} }, 4096)[0];
-            ggml_free(c);
-        }
+        T* xo = ln(c, tok, m.get("bb.norm" + std::to_string(s) + ".weight"),
+                   m.get("bb.norm" + std::to_string(s) + ".bias"));
+        outs[s] = ggml_cont(c, ggml_transpose(c, xo));                                     // [N, C] == torch [C,H,W]
         out.C[s] = C; out.H[s] = H; out.W[s] = W;
-        out.f[s].resize((size_t)C * H * W);
-        for (int n = 0; n < N; ++n) for (int cc = 0; cc < C; ++cc)
-            out.f[s][(size_t)cc * H * W + n] = xout[(size_t)cc + (size_t)C * n];
-        if (s < 3) {   // PatchMerging on the (pre-norm) block output `tok`
-            int Hh = H/2, Wh = W/2, Nh = Hh*Wh;
-            std::vector<int32_t> mg[4];
-            for (int q = 0; q < 4; ++q) mg[q].resize(Nh);
-            for (int hr = 0; hr < Hh; ++hr) for (int wr = 0; wr < Wh; ++wr) {
-                int np = hr*Wh + wr;
-                mg[0][np]=(2*hr)*W+(2*wr); mg[1][np]=(2*hr+1)*W+(2*wr);
-                mg[2][np]=(2*hr)*W+(2*wr+1); mg[3][np]=(2*hr+1)*W+(2*wr+1);
-            }
-            ggml_context* c = mkctx();
-            T* x = ggml_new_tensor_2d(c, GGML_TYPE_F32, C, N); ggml_set_input(x);
-            T* g0=ggml_new_tensor_1d(c,GGML_TYPE_I32,Nh); T* g1=ggml_new_tensor_1d(c,GGML_TYPE_I32,Nh);
-            T* g2=ggml_new_tensor_1d(c,GGML_TYPE_I32,Nh); T* g3=ggml_new_tensor_1d(c,GGML_TYPE_I32,Nh);
-            ggml_set_input(g0); ggml_set_input(g1); ggml_set_input(g2); ggml_set_input(g3);
-            std::string dp = "bb.layers." + std::to_string(s) + ".downsample.";
-            T* x0=ggml_get_rows(c,x,g0); T* x1=ggml_get_rows(c,x,g1);
-            T* x2=ggml_get_rows(c,x,g2); T* x3=ggml_get_rows(c,x,g3);
-            T* cat = ggml_concat(c, ggml_concat(c,x0,x1,0), ggml_concat(c,x2,x3,0), 0);   // [4C,Nh]
-            cat = ln(c, cat, m.get(dp+"norm.weight"), m.get(dp+"norm.bias"));
-            T* nx = ggml_mul_mat(c, m.get(dp+"reduction.weight"), cat);                    // [2C,Nh]
-            tok = run_graph(m, c, {nx}, { {x,tok.data()}, {g0,mg[0].data()}, {g1,mg[1].data()}, {g2,mg[2].data()}, {g3,mg[3].data()} }, 4096)[0];
-            ggml_free(c);
+        if (s < 3) {   // PatchMerging on the pre-norm block output
+            const int Nh = (H / 2) * (W / 2);
+            T* x[4];
+            for (int q = 0; q < 4; ++q)
+                x[q] = ggml_get_rows(c, tok, input(ggml_new_tensor_1d(c, GGML_TYPE_I32, Nh), si.merge[q].data()));
+            const std::string dp = "bb.layers." + std::to_string(s) + ".downsample.";
+            T* cat = ggml_concat(c, ggml_concat(c, x[0], x[1], 0), ggml_concat(c, x[2], x[3], 0), 0);   // [4C, Nh]
+            cat = ln(c, cat, m.get(dp + "norm.weight"), m.get(dp + "norm.bias"));
+            tok = ggml_mul_mat(c, m.get(dp + "reduction.weight"), cat);                                 // [2C, Nh]
             C *= 2; H /= 2; W /= 2;
         }
     }
+    std::vector<std::vector<float>> r = run_graph(m, c, {outs[0], outs[1], outs[2], outs[3]}, ins);
+    ggml_free(c);
+    for (int s = 0; s < 4; ++s) out.f[s] = std::move(r[s]);
     return out;
 }
 
 // ============================ squeeze + decoder ============================
 // Host feature map in torch [C,H,W] order (== ggml [W,H,C] same bytes).
 struct Feat { std::vector<float> d; int C = 0, H = 0, W = 0; };
-
-// conv2d via ggml; torch[C,H,W] -> [OC,Ho,Wo] (stride 1). bias added if present.
-static Feat conv2d(const Model& m, const std::string& p, const Feat& x, int pad) {
-    T* w = m.get(p + ".weight");
-    const int KW = (int)w->ne[0], KH = (int)w->ne[1], OC = (int)w->ne[3];
-    const int Ho = x.H + 2*pad - KH + 1, Wo = x.W + 2*pad - KW + 1;
-    auto run = [&](const Feat& in, int graph_pad) {
-        Feat r;
-        ggml_context* c = mkctx();
-        T* gx = ggml_new_tensor_3d(c, GGML_TYPE_F32, in.W, in.H, in.C); ggml_set_input(gx);
-        T* y = ggml_conv_2d(c, w, gx, 1, 1, graph_pad, graph_pad, 1, 1);
-        if (m.has(p + ".bias")) y = ggml_add(c, y, ggml_reshape_3d(c, m.get(p + ".bias"), 1, 1, OC));
-        ggml_set_name(y, p.c_str());
-        r.C = OC; r.H = (int)y->ne[1]; r.W = (int)y->ne[0];
-        r.d = run_graph(m, c, {y}, { {gx, in.d.data()} })[0];
-        ggml_free(c);
-        return r;
-    };
-
-    int max_rows = 512;
-    if (const char* e = getenv("TRELLIS_BIREFNET_CONV_ROWS")) max_rows = std::max(1, atoi(e));
-    if (Ho <= max_rows) return run(x, pad);
-
-    Feat out; out.C = OC; out.H = Ho; out.W = Wo;
-    out.d.resize((size_t)OC * Ho * Wo);
-    for (int y0 = 0; y0 < Ho; y0 += max_rows) {
-        const int nr = std::min(max_rows, Ho - y0);
-        // Slice the conceptually zero-padded input, including KH-1 halo rows.
-        // Running this tile with graph_pad=0 produces exactly output rows [y0,y0+nr).
-        Feat tile; tile.C = x.C; tile.H = nr + KH - 1; tile.W = x.W + 2*pad;
-        tile.d.assign((size_t)tile.C * tile.H * tile.W, 0.0f);
-        for (int c = 0; c < x.C; ++c) for (int ty = 0; ty < tile.H; ++ty) {
-            const int sy = y0 + ty - pad;
-            if (sy < 0 || sy >= x.H) continue;
-            std::memcpy(&tile.d[((size_t)c*tile.H + ty)*tile.W + pad],
-                        &x.d[((size_t)c*x.H + sy)*x.W], (size_t)x.W * sizeof(float));
-        }
-        Feat part = run(tile, 0);
-        if (part.H != nr || part.W != Wo) throw std::runtime_error("birefnet: invalid conv stripe shape");
-        for (int c = 0; c < OC; ++c)
-            std::memcpy(&out.d[((size_t)c*Ho + y0)*Wo], &part.d[(size_t)c*nr*Wo],
-                        (size_t)nr * Wo * sizeof(float));
-    }
-    return out;
-}
-static void bn(const Model& m, const std::string& p, Feat& x) {     // folded BN: per-channel scale/shift
-    std::vector<float> sc = tensor_to_f32(m.get(p + ".scale")), sh = tensor_to_f32(m.get(p + ".shift"));
-    long HW = (long)x.H * x.W;
-    for (int ch = 0; ch < x.C; ++ch) { float a = sc[ch], b = sh[ch];
-        for (long i = 0; i < HW; ++i) x.d[(size_t)ch*HW + i] = x.d[(size_t)ch*HW + i]*a + b; }
-}
-static void relu(Feat& x) { for (auto& v : x.d) if (v < 0) v = 0; }
 
 static Feat interp(const Feat& x, int Ho, int Wo) {                 // bilinear, align_corners=True
     Feat o; o.C = x.C; o.H = Ho; o.W = Wo; o.d.resize((size_t)x.C * Ho * Wo);
@@ -319,59 +270,6 @@ static Feat interp(const Feat& x, int Ho, int Wo) {                 // bilinear,
                 o.d[(size_t)ch*Ho*Wo + (size_t)ho*Wo + wo] = (float)v; } } }
     return o;
 }
-static Feat concat_ch(std::vector<const Feat*> fs) {               // along channel
-    Feat o; o.H = fs[0]->H; o.W = fs[0]->W; o.C = 0;
-    for (auto f : fs) o.C += f->C;
-    o.d.resize((size_t)o.C * o.H * o.W); size_t off = 0;
-    for (auto f : fs) { std::memcpy(&o.d[off], f->d.data(), f->d.size()*sizeof(float)); off += f->d.size(); }
-    return o;
-}
-static Feat from_bb(const BBOut& b, int i) { Feat f; f.C=b.C[i]; f.H=b.H[i]; f.W=b.W[i]; f.d=b.f[i]; return f; }
-
-// one DeformableConv2d + bn + relu (a _ASPPModuleDeformable)
-static Feat deform_module(const Model& m, const std::string& p, const Feat& x, int gpu) {
-    std::string ac = p + ".atrous_conv";
-    int K = (int)m.get(ac + ".regular_conv.weight")->ne[0];
-    Feat off = conv2d(m, ac + ".offset_conv", x, K/2);             // [2K^2,H,W]
-    Feat mod = conv2d(m, ac + ".modulator_conv", x, K/2);         // [K^2,H,W]
-    for (auto& v : mod.d) v = 2.0f / (1.0f + std::exp(-v));        // 2*sigmoid
-    T* w = m.get(ac + ".regular_conv.weight"); int OC = (int)w->ne[3];
-    std::vector<float> wt = tensor_to_f32(w);                      // [KW,KH,Cin,OC] == [OC,Cin,K,K] C-order
-    Feat o; o.C = OC; o.H = x.H; o.W = x.W; o.d.resize((size_t)OC * x.H * x.W);
-    deform_conv2d_run(x.d.data(), x.C, x.H, x.W, off.d.data(), mod.d.data(), wt.data(), nullptr, OC, K, o.d.data(), gpu);
-    bn(m, p + ".bn", o); relu(o);
-    return o;
-}
-static Feat global_pool_branch(const Model& m, const std::string& p, const Feat& x) {
-    long HW = (long)x.H * x.W;
-    std::vector<float> a(x.C); for (int ch = 0; ch < x.C; ++ch) { double s = 0; for (long i=0;i<HW;++i) s += x.d[(size_t)ch*HW+i]; a[ch] = (float)(s/HW); }
-    T* w = m.get(p + ".1.weight"); int OC = (int)w->ne[3]; std::vector<float> wt = tensor_to_f32(w);  // [1,1,Cin,OC]
-    Feat o; o.C = OC; o.H = 1; o.W = 1; o.d.assign(OC, 0.f);
-    for (int oc = 0; oc < OC; ++oc) { double s = 0; for (int ic = 0; ic < x.C; ++ic) s += wt[(size_t)ic + (size_t)x.C*oc]*a[ic]; o.d[oc] = (float)s; }
-    bn(m, p + ".2", o); relu(o);
-    Feat r; r.C = OC; r.H = x.H; r.W = x.W; r.d.resize((size_t)OC * x.H * x.W);
-    for (int oc = 0; oc < OC; ++oc) for (long i = 0; i < HW; ++i) r.d[(size_t)oc*HW + i] = o.d[oc];
-    return r;
-}
-static Feat aspp_deformable(const Model& m, const std::string& p, const Feat& x, int gpu) {
-    Feat x1 = deform_module(m, p + ".aspp1", x, gpu);
-    Feat d0 = deform_module(m, p + ".aspp_deforms.0", x, gpu);
-    Feat d1 = deform_module(m, p + ".aspp_deforms.1", x, gpu);
-    Feat d2 = deform_module(m, p + ".aspp_deforms.2", x, gpu);
-    Feat g  = global_pool_branch(m, p + ".global_avg_pool", x);
-    Feat cat = concat_ch({&x1, &d0, &d1, &d2, &g});               // 1280
-    Feat o = conv2d(m, p + ".conv1", cat, 0); bn(m, p + ".bn1", o); relu(o);
-    return o;
-}
-static Feat basic_dec_blk(const Model& m, const std::string& p, const Feat& x, int gpu) {
-    Feat o = conv2d(m, p + ".conv_in", x, 1); bn(m, p + ".bn_in", o); relu(o);
-    o = aspp_deformable(m, p + ".dec_att", o, gpu);
-    o = conv2d(m, p + ".conv_out", o, 1); bn(m, p + ".bn_out", o);
-    return o;
-}
-static Feat simple_convs(const Model& m, const std::string& p, const Feat& x) {
-    return conv2d(m, p + ".conv_out", conv2d(m, p + ".conv1", x, 1), 1);   // two 3x3, no act between
-}
 static Feat image2patches(const Feat& img, int Href, int Wref) {  // 'b c (hg h)(wg w)->b (c hg wg) h w'
     int hg = img.H / Href, wg = img.W / Wref;
     Feat o; o.C = img.C * hg * wg; o.H = Href; o.W = Wref; o.d.resize((size_t)o.C * Href * Wref);
@@ -383,60 +281,189 @@ static Feat image2patches(const Feat& img, int Href, int Wref) {  // 'b c (hg h)
     }
     return o;
 }
-static void gdt_attn(const Model& m, int level, Feat& p, int gpu) { (void)gpu;
-    std::string g = "decoder.gdt_convs_" + std::to_string(level);
-    Feat h = conv2d(m, g + ".0", p, 1); bn(m, g + ".1", h); relu(h);   // ->16
-    Feat at = conv2d(m, "decoder.gdt_convs_attn_" + std::to_string(level) + ".0", h, 0);  // 1x1 ->1
-    for (auto& v : at.d) v = 1.0f / (1.0f + std::exp(-v));
-    long HW = (long)p.H * p.W;
-    for (int c = 0; c < p.C; ++c) for (long i = 0; i < HW; ++i) p.d[(size_t)c*HW + i] *= at.d[i];
+
+// A decoder graph under construction: its context, the host buffers it uploads, and the pieces of
+// arithmetic the decoder is made of. Every feature map is ggml [W,H,C], which is torch [C,H,W].
+struct DecGraph {
+    const Model& m;
+    ggml_context* c = mkctx(4096);
+    std::vector<std::pair<T*, const void*>> ins;
+
+    explicit DecGraph(const Model& model) : m(model) {}
+    ~DecGraph() { ggml_free(c); }
+    DecGraph(const DecGraph&) = delete;
+    DecGraph& operator=(const DecGraph&) = delete;
+
+    T* in(const Feat& f) {
+        T* t = ggml_new_tensor_3d(c, GGML_TYPE_F32, f.W, f.H, f.C);
+        ggml_set_input(t); ins.push_back({t, f.d.data()});
+        return t;
+    }
+    T* conv(const std::string& p, T* x, int pad) {                  // stride 1, bias if the model has one
+        T* y = ggml_conv_2d(c, m.get(p + ".weight"), x, 1, 1, pad, pad, 1, 1);
+        if (m.has(p + ".bias")) y = ggml_add(c, y, ggml_reshape_3d(c, m.get(p + ".bias"), 1, 1, y->ne[2]));
+        return y;
+    }
+    T* bn(const std::string& p, T* x) {                             // folded BN: per-channel scale/shift
+        const int64_t C = x->ne[2];
+        return ggml_add(c, ggml_mul(c, x, ggml_reshape_3d(c, m.get(p + ".scale"), 1, 1, C)),
+                        ggml_reshape_3d(c, m.get(p + ".shift"), 1, 1, C));
+    }
+    T* interp(T* x, int H, int W) {                                 // bilinear, align_corners=True
+        return ggml_interpolate(c, x, W, H, x->ne[2], 1, GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ALIGN_CORNERS);
+    }
+    T* cat(std::vector<T*> xs) {                                    // along channels
+        T* r = xs[0];
+        for (size_t i = 1; i < xs.size(); ++i) r = ggml_concat(c, r, xs[i], 2);
+        return r;
+    }
+    std::vector<Feat> run(std::vector<T*> outs) {
+        std::vector<std::vector<float>> r = run_graph(m, c, outs, ins, 4096);
+        std::vector<Feat> f(outs.size());
+        for (size_t i = 0; i < outs.size(); ++i) {
+            f[i].d = std::move(r[i]);
+            f[i].W = (int)outs[i]->ne[0]; f[i].H = (int)outs[i]->ne[1]; f[i].C = (int)outs[i]->ne[2];
+        }
+        return f;
+    }
+};
+
+// The four deformable branches of an ASPPDeformable, in the order the aspp concatenates them.
+static const char* DEFORM_BRANCHES[4] = { ".aspp1", ".aspp_deforms.0", ".aspp_deforms.1", ".aspp_deforms.2" };
+
+// One BasicDecBlk (conv_in -> ASPPDeformable -> conv_out), plus the GDT attention gate that follows
+// decoder blocks 2-4. It runs as two graphs around the deformable convolutions, the one step ggml
+// has no op for: the first builds the block's input and everything the deformable convs read, the
+// second everything after them. `input` builds the block's input inside the first graph.
+static Feat dec_block(const Model& m, const std::string& p, const std::function<T*(DecGraph&)>& input,
+                      int gdt_level, int gpu) {
+    const std::string a = p + ".dec_att";
+    Feat o, offs[4], mods[4], pooled;
+    {
+        DecGraph g(m);
+        T* x = ggml_relu(g.c, g.bn(p + ".bn_in", g.conv(p + ".conv_in", input(g), 1)));
+        std::vector<T*> outs = { x };
+        for (const char* branch : DEFORM_BRANCHES) {
+            const std::string ac = a + branch + ".atrous_conv";
+            const int K = (int)m.get(ac + ".regular_conv.weight")->ne[0];
+            outs.push_back(g.conv(ac + ".offset_conv", x, K / 2));                          // [W,H,2K^2]
+            outs.push_back(ggml_scale(g.c, ggml_sigmoid(g.c, g.conv(ac + ".modulator_conv", x, K / 2)), 2.0f));
+        }
+        // global_avg_pool: mean over the map -> 1x1 conv -> BN -> ReLU, one value per channel
+        const std::string gp = a + ".global_avg_pool";
+        T* w = m.get(gp + ".1.weight");                                                     // [1,1,Cin,OC]
+        T* mean = ggml_mean(g.c, ggml_reshape_2d(g.c, ggml_cont(g.c, x), x->ne[0] * x->ne[1], x->ne[2]));  // [1, Cin]
+        T* v = ggml_mul_mat(g.c, ggml_reshape_2d(g.c, w, w->ne[2], w->ne[3]), ggml_reshape_2d(g.c, mean, x->ne[2], 1));
+        outs.push_back(ggml_relu(g.c, g.bn(gp + ".2", ggml_reshape_3d(g.c, v, 1, 1, w->ne[3]))));
+        std::vector<Feat> r = g.run(outs);
+        o = std::move(r[0]);
+        for (int i = 0; i < 4; ++i) { offs[i] = std::move(r[1 + 2*i]); mods[i] = std::move(r[2 + 2*i]); }
+        pooled = std::move(r[9]);
+    }
+    Feat d[4];
+    for (int i = 0; i < 4; ++i) {
+        T* w = m.get(a + DEFORM_BRANCHES[i] + ".atrous_conv.regular_conv.weight");
+        const int K = (int)w->ne[0], OC = (int)w->ne[3];
+        std::vector<float> wt = tensor_to_f32(w);                    // [KW,KH,Cin,OC] == [OC,Cin,K,K] C-order
+        d[i].C = OC; d[i].H = o.H; d[i].W = o.W; d[i].d.resize((size_t)OC * o.H * o.W);
+        deform_conv2d_run(o.d.data(), o.C, o.H, o.W, offs[i].d.data(), mods[i].d.data(), wt.data(), nullptr,
+                          OC, K, d[i].d.data(), gpu);
+    }
+    DecGraph g(m);
+    std::vector<T*> branches;
+    for (int i = 0; i < 4; ++i) branches.push_back(ggml_relu(g.c, g.bn(a + DEFORM_BRANCHES[i] + ".bn", g.in(d[i]))));
+    T* pool = g.in(pooled);                                                               // [1,1,OC]
+    branches.push_back(ggml_repeat(g.c, pool, ggml_new_tensor_3d(g.c, GGML_TYPE_F32, o.W, o.H, pool->ne[2])));
+    T* y = ggml_relu(g.c, g.bn(a + ".bn1", g.conv(a + ".conv1", g.cat(branches), 0)));
+    y = g.bn(p + ".bn_out", g.conv(p + ".conv_out", y, 1));
+    if (gdt_level > 0) {
+        const std::string gl = "decoder.gdt_convs_" + std::to_string(gdt_level);
+        T* h = ggml_relu(g.c, g.bn(gl + ".1", g.conv(gl + ".0", y, 1)));
+        T* at = ggml_sigmoid(g.c, g.conv("decoder.gdt_convs_attn_" + std::to_string(gdt_level) + ".0", h, 0));
+        y = ggml_mul(g.c, y, at);
+    }
+    return std::move(g.run({ y })[0]);
 }
+
+// simple_convs over the image cut into patches at the block's resolution (ipt_blk*).
+static T* image_features(DecGraph& g, const std::string& blk, const Feat& patches) {
+    const std::string p = "decoder." + blk;
+    return g.conv(p + ".conv_out", g.conv(p + ".conv1", g.in(patches), 1), 1);             // two 3x3, no act
+}
+
+// The decoder's last stage as one graph: upsample decoder_block1's output to the image, concat the
+// ipt_blk1 image features, and project with conv_out1 (1x1). The 1x1 projection, the concat and
+// the bilinear upsample are all linear, so the projection is split per concat half and the
+// upsample moved after it: interp(W*p) == W*interp(p). That upsamples one channel instead of 192,
+// and the two 3x3 image convs run as direct convolutions instead of im2col stripes at 1024^2.
+static std::vector<float> decoder_tail(const Model& m, const Feat& p, const Feat& img) {
+    T* w = m.get("decoder.conv_out1.0.weight");                     // [1,1,IC,1]
+    const int ICp = p.C, ICe = (int)w->ne[2] - p.C;
+    ggml_context* c = mkctx(256);
+    T* gp = ggml_new_tensor_3d(c, GGML_TYPE_F32, p.W, p.H, p.C);     ggml_set_input(gp);
+    T* gi = ggml_new_tensor_3d(c, GGML_TYPE_F32, img.W, img.H, img.C); ggml_set_input(gi);
+    auto conv = [&](T* k, T* x, int pad) { return ggml_conv_2d_direct(c, k, x, 1, 1, pad, pad, 1, 1); };
+    auto bias = [&](T* y, const std::string& name) {
+        return ggml_add(c, y, ggml_reshape_3d(c, m.get(name), 1, 1, m.get(name)->ne[0]));
+    };
+    T* wp = ggml_view_4d(c, w, 1, 1, ICp, 1, w->nb[1], w->nb[2], w->nb[3], 0);
+    T* we = ggml_view_4d(c, w, 1, 1, ICe, 1, w->nb[1], w->nb[2], w->nb[3], (size_t)ICp * w->nb[2]);
+    T* up = ggml_interpolate(c, conv(wp, gp, 0), img.W, img.H, 1, 1,
+                             GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ALIGN_CORNERS);
+    T* e = bias(conv(m.get("decoder.ipt_blk1.conv1.weight"), gi, 1), "decoder.ipt_blk1.conv1.bias");
+    e = bias(conv(m.get("decoder.ipt_blk1.conv_out.weight"), e, 1), "decoder.ipt_blk1.conv_out.bias");
+    T* out = bias(ggml_add(c, up, conv(we, e, 0)), "decoder.conv_out1.0.bias");
+    std::vector<float> r = run_graph(m, c, {out}, { {gp, p.d.data()}, {gi, img.d.data()} }, 256)[0];
+    ggml_free(c);
+    return r;
+}
+
+static Feat from_bb(const BBOut& b, int i) { Feat f; f.C=b.C[i]; f.H=b.H[i]; f.W=b.W[i]; f.d=b.f[i]; return f; }
 
 std::vector<float> birefnet_matte(const Model& m, const std::vector<float>& chw1024, int gpu) {
     Feat img; img.C = 3; img.H = 1024; img.W = 1024; img.d = chw1024;
     // ---- backbone twice (mul_scl_ipt='cat') ----
-    BBOut full = swin_backbone(m, chw1024, 1024);
-    Feat img512 = interp(img, 512, 512);
-    BBOut half = swin_backbone(m, img512.d, 512);
-    Feat xs[4];
-    for (int i = 0; i < 4; ++i) {
-        Feat f = from_bb(full, i), h = from_bb(half, i);
-        Feat hi = interp(h, f.H, f.W);
-        xs[i] = concat_ch({&f, &hi});                 // doubled channels
+    const BBOut full = swin_backbone(m, chw1024, 1024);
+    const Feat img512 = interp(img, 512, 512);
+    const BBOut half = swin_backbone(m, img512.d, 512);
+    // xs[i] = cat(full_i, half_i upsampled to full_i's size): doubled channels
+    std::vector<Feat> xs;
+    {
+        Feat f[4], h[4];
+        for (int i = 0; i < 4; ++i) { f[i] = from_bb(full, i); h[i] = from_bb(half, i); }
+        DecGraph g(m);
+        std::vector<T*> outs;
+        for (int i = 0; i < 4; ++i) outs.push_back(g.cat({ g.in(f[i]), g.interp(g.in(h[i]), f[i].H, f[i].W) }));
+        xs = g.run(outs);
     }
-    // ---- cxt cat on x4 + squeeze ----
-    Feat c1 = interp(xs[0], xs[3].H, xs[3].W), c2 = interp(xs[1], xs[3].H, xs[3].W), c3 = interp(xs[2], xs[3].H, xs[3].W);
-    Feat x4c = concat_ch({&c1, &c2, &c3, &xs[3]});    // 5760@32
-    Feat x4 = basic_dec_blk(m, "squeeze_module.0", x4c, gpu);   // 3072@32
+    const Feat pat32 = image2patches(img, 32, 32), pat64 = image2patches(img, 64, 64),
+               pat128 = image2patches(img, 128, 128), pat256 = image2patches(img, 256, 256);
 
-    Feat x1 = xs[0], x2 = xs[1], x3 = xs[2];
+    // ---- cxt cat on x4 + squeeze ----
+    const Feat x4 = dec_block(m, "squeeze_module.0", [&](DecGraph& g) {
+        const int H = xs[3].H, W = xs[3].W;
+        return g.cat({ g.interp(g.in(xs[0]), H, W), g.interp(g.in(xs[1]), H, W), g.interp(g.in(xs[2]), H, W),
+                       g.in(xs[3]) });                                                   // 5760@32
+    }, 0, gpu);                                                                          // 3072@32
+
     // ---- decoder ----
-    auto ipt = [&](const std::string& blk, int ref, const Feat& add_to) {
-        Feat pat = image2patches(img, ref, ref);
-        return simple_convs(m, "decoder." + blk, pat);
+    const Feat p4 = dec_block(m, "decoder.decoder_block4", [&](DecGraph& g) {
+        return g.cat({ g.in(x4), image_features(g, "ipt_blk5", pat32) });               // 3456@32
+    }, 4, gpu);                                                                          // 1536@32
+    // Each later block: the previous output upsampled plus a lateral 1x1 of the backbone feature,
+    // then the image features at that resolution.
+    auto next = [](const Feat& prev, const Feat& lateral_in, const std::string& lateral, const std::string& ipt,
+                   const Feat& patches) {
+        return [prev = &prev, lat = &lateral_in, patches = &patches, lateral, ipt](DecGraph& g) {
+            T* up = ggml_add(g.c, g.interp(g.in(*prev), lat->H, lat->W),
+                             g.conv("decoder." + lateral + ".conv", g.in(*lat), 0));
+            return g.cat({ up, image_features(g, ipt, *patches) });
+        };
     };
-    // block4
-    { Feat e = ipt("ipt_blk5", x4.H, x4); x4 = concat_ch({&x4, &e}); }   // 3456@32
-    Feat p4 = basic_dec_blk(m, "decoder.decoder_block4", x4, gpu);       // 1536@32
-    gdt_attn(m, 4, p4, gpu);
-    Feat _p = interp(p4, x3.H, x3.W);                                    // 1536@64
-    { Feat lat = conv2d(m, "decoder.lateral_block4.conv", x3, 0); for (size_t i=0;i<_p.d.size();++i) _p.d[i]+=lat.d[i]; }
-    { Feat e = ipt("ipt_blk4", x3.H, _p); _p = concat_ch({&_p, &e}); }   // 1920@64
-    Feat p3 = basic_dec_blk(m, "decoder.decoder_block3", _p, gpu);       // 768@64
-    gdt_attn(m, 3, p3, gpu);
-    _p = interp(p3, x2.H, x2.W);                                         // 768@128
-    { Feat lat = conv2d(m, "decoder.lateral_block3.conv", x2, 0); for (size_t i=0;i<_p.d.size();++i) _p.d[i]+=lat.d[i]; }
-    { Feat e = ipt("ipt_blk3", x2.H, _p); _p = concat_ch({&_p, &e}); }   // 960@128
-    Feat p2 = basic_dec_blk(m, "decoder.decoder_block2", _p, gpu);       // 384@128
-    gdt_attn(m, 2, p2, gpu);
-    _p = interp(p2, x1.H, x1.W);                                         // 384@256
-    { Feat lat = conv2d(m, "decoder.lateral_block2.conv", x1, 0); for (size_t i=0;i<_p.d.size();++i) _p.d[i]+=lat.d[i]; }
-    { Feat e = ipt("ipt_blk2", x1.H, _p); _p = concat_ch({&_p, &e}); }   // 480@256
-    _p = basic_dec_blk(m, "decoder.decoder_block1", _p, gpu);            // 192@256
-    _p = interp(_p, 1024, 1024);                                         // 192@1024
-    { Feat e = ipt("ipt_blk1", 1024, _p); _p = concat_ch({&_p, &e}); }   // 240@1024
-    Feat outp = conv2d(m, "decoder.conv_out1.0", _p, 0);                 // 1@1024
-    return outp.d;
+    const Feat p3 = dec_block(m, "decoder.decoder_block3", next(p4, xs[2], "lateral_block4", "ipt_blk4", pat64), 3, gpu);
+    const Feat p2 = dec_block(m, "decoder.decoder_block2", next(p3, xs[1], "lateral_block3", "ipt_blk3", pat128), 2, gpu);
+    const Feat p1 = dec_block(m, "decoder.decoder_block1", next(p2, xs[0], "lateral_block2", "ipt_blk2", pat256), 0, gpu);
+    return decoder_tail(m, p1, img);                                                     // 1@1024
 }
 
 } // namespace trellis
