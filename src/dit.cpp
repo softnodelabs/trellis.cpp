@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
