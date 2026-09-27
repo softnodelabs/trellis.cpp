@@ -33,9 +33,9 @@ class TriBvh;
 // inside are the inner skin and are removed, the rims this leaves where an opening of the input
 // joined the two skins are capped, and hollows left sealed inside the solid are dropped. Points
 // beside an open sheet see it on one side only and vote outside, so an open sheet keeps its
-// two-sided shell as before.
+// two-sided shell as before. On by default; pass false for the raw two-sheet band surface.
 Mesh remesh_narrow_band_dc(const float* verts, int64_t V, const int32_t* faces, int64_t F,
                            const TriBvh& bvh, int res, int band = 1,
-                           float project_back = 0.0f, bool fill_inside = false);
+                           float project_back = 0.0f, bool fill_inside = true);
 
 }  // namespace trellis
