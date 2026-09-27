@@ -20,6 +20,9 @@ public:
     static TriBvh build(const float* verts, int64_t V, const int32_t* faces, int64_t F);
 
     Hit closest(const float p[3], float max_dist = 1e30f) const;
+    // How many triangles the ray from `origin` along `dir` crosses, either side counted. On a
+    // closed surface an odd count means `origin` is inside, whatever the winding.
+    int count_crossings(const float origin[3], const float dir[3]) const;
     bool empty() const { return nodes_.empty(); }
 
 private:

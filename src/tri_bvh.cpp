@@ -186,4 +186,55 @@ TriBvh::Hit TriBvh::closest(const float p[3], float max_dist) const {
     return hit;
 }
 
+int TriBvh::count_crossings(const float o[3], const float d[3]) const {
+    if (nodes_.empty()) return 0;
+    float inv[3];
+    for (int k = 0; k < 3; ++k) inv[k] = 1.f / d[k];
+    int count = 0;
+    int32_t stack[64];
+    int sp = 0;
+    stack[sp++] = 0;
+    while (sp > 0) {
+        const Node& n = nodes_[stack[--sp]];
+        // Slab test against the ray's forward half.
+        float t0 = 0.f, t1 = 1e30f;
+        bool miss = false;
+        for (int k = 0; k < 3 && !miss; ++k) {
+            float a = (n.bmin[k] - o[k]) * inv[k], b = (n.bmax[k] - o[k]) * inv[k];
+            if (a > b) std::swap(a, b);
+            t0 = std::max(t0, a);
+            t1 = std::min(t1, b);
+            miss = t0 > t1;
+        }
+        if (miss) continue;
+        if (n.count > 0) {
+            for (int32_t i = 0; i < n.count; ++i) {
+                const int32_t f = prim_[n.left + i];
+                const float* a = &verts_[3*faces_[3*f]];
+                const float* b = &verts_[3*faces_[3*f+1]];
+                const float* c = &verts_[3*faces_[3*f+2]];
+                // Möller-Trumbore, both sides.
+                float e1[3], e2[3], s[3];
+                for (int k = 0; k < 3; ++k) { e1[k] = b[k]-a[k]; e2[k] = c[k]-a[k]; s[k] = o[k]-a[k]; }
+                const float p[3] = {d[1]*e2[2]-d[2]*e2[1], d[2]*e2[0]-d[0]*e2[2], d[0]*e2[1]-d[1]*e2[0]};
+                const float det = dot3(e1, p);
+                if (std::fabs(det) < 1e-20f) continue;
+                const float inv_det = 1.f / det;
+                const float u = dot3(s, p) * inv_det;
+                if (u < 0.f || u > 1.f) continue;
+                const float q[3] = {s[1]*e1[2]-s[2]*e1[1], s[2]*e1[0]-s[0]*e1[2], s[0]*e1[1]-s[1]*e1[0]};
+                const float v = dot3(d, q) * inv_det;
+                if (v < 0.f || u + v > 1.f) continue;
+                if (dot3(e2, q) * inv_det > 0.f) ++count;
+            }
+            continue;
+        }
+        if (sp + 2 <= 64) {
+            stack[sp++] = n.left;
+            stack[sp++] = n.left + 1;
+        }
+    }
+    return count;
+}
+
 }  // namespace trellis
