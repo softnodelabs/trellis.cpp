@@ -20,6 +20,111 @@ Prebuilt binaries for Linux and Windows (Vulkan, ROCm, CUDA) are published on th
 [releases page](../../releases). Serves as the `trellis` backend of
 [Lemonade](https://github.com/lemonade-sdk/lemonade).
 
+## About this fork
+
+This is a fork of [pwilkin/trellis.cpp](https://github.com/pwilkin/trellis.cpp),
+branched from upstream's `v0.6.0`. This section lists every way its code differs
+from upstream. The rest of this README is upstream's and describes upstream's
+project. In particular, the install scripts, Trellis Studio and the prebuilt
+binaries install **upstream's** build, not this fork. Build this fork from source
+(see [Building](#building)).
+
+### Added in this fork
+
+- **Pixal3D multiview conditioning**
+  ([`150b6fa`](https://github.com/softnodelabs/trellis.cpp/commit/150b6fa)).
+  - Generates a model from several calibrated views of the subject instead of
+    one image. The views come from a `transforms.json` rig, or are four turntable
+    views (front, right, back, left).
+  - This is the library side of
+    [raven38/pixal3d.cpp](https://github.com/raven38/pixal3d.cpp), ported here:
+    - the projection grid;
+    - sparse-structure and SLAT conditioning from the projected views;
+    - the NAF feature upsampler, with its CUDA attention kernel;
+    - projected attention in the DiT;
+    - GGUF converter entries for the Pixal3D flows (multiview `mv` and
+      single-view `sv` weights) and for NAF.
+  - It is a library API: `pixal3d_cond_*`, `load_views_metadata` and
+    `pixal3d_write_production_glb`. `trellis-cli` does not drive it.
+  - pixal3d.cpp's changes to the sparse, shape-decoder and remesh code for its
+    browser build were left out, so dense res-1024 decodes keep their bounded
+    memory.
+
+### Fixes and improvements in this fork
+
+- **Remesh keeps only the outer surface**
+  ([`4108bf3`](https://github.com/softnodelabs/trellis.cpp/commit/4108bf3),
+  [`a723dc1`](https://github.com/softnodelabs/trellis.cpp/commit/a723dc1)).
+  - The narrow-band dual contour takes the boundary of `|UDF| < eps`. Around a
+    closed solid that boundary has two sheets, so every solid came out as a hollow
+    shell. Its hidden inner sheet held about half the faces and half the texture
+    atlas, and it crowded thin parts such as blades, leaves and feathers.
+  - `remesh_narrow_band_dc` now removes the inner sheet:
+    - enclosed spaces are found on a coarse grid;
+    - each space is voted inside or outside by ray parity, which does not depend
+      on the input's winding;
+    - the openings this leaves are capped;
+    - sealed hollows are dropped.
+  - The result is one closed, outward-wound surface with half the area. The
+    visible shape is unchanged, and the remesh takes 1–3 s longer.
+  - Open sheets keep their two-sided shell.
+  - This is on by default. Pass `fill_inside = false` to get the raw band
+    surface. `TriBvh` gains `count_crossings` for the parity vote.
+- **Faster UV unwrapping on large closed meshes**
+  ([`88d2dfc`](https://github.com/softnodelabs/trellis.cpp/commit/88d2dfc)).
+  - xatlas charts each merge cluster on a single thread, and its cost grows
+    faster than the cluster does.
+  - Clusters now stop merging at 50k faces. On a closed 1M-face surface,
+    charting drops from about 250 s (close to the 300 s timeout) to about 110 s.
+- **`clean_mesh` keeps each region's majority winding**
+  ([`88d2dfc`](https://github.com/softnodelabs/trellis.cpp/commit/88d2dfc)).
+  - The winding repair used to flip each connected region to match the region's
+    first face. When that face was one of a few wound the wrong way, the whole
+    region came out inside out.
+  - Now the winding most of the region's faces already have wins.
+- **BiRefNet about 10× faster**
+  ([`7d9d4fe`](https://github.com/softnodelabs/trellis.cpp/commit/7d9d4fe)).
+  - The Swin backbone runs as one graph per input scale, and each decoder block
+    as two graphs, instead of dozens of graphs with host round trips and
+    host-side BN, resizes and concats.
+  - The CUDA/HIP deformable convolution reuses each bilinear sample across
+    channels.
+  - A 1024 matte takes 1.0 s instead of 10.7 s on an RTX 4070. Mattes match the
+    previous implementation to within 1/255, and peak memory is unchanged.
+- **No leak when a model load fails**
+  ([`112f294`](https://github.com/softnodelabs/trellis.cpp/commit/112f294)).
+  - A load that failed after allocating (a truncated file, say) left the backend,
+    the full weight buffer and the gguf contexts allocated.
+  - All of them are now freed on every error path, and the file is closed.
+- **Build fix**: `dit.cpp` includes `<stdexcept>` for its checkpoint shape error
+  ([`9249b57`](https://github.com/softnodelabs/trellis.cpp/commit/9249b57)).
+
+### Taken from upstream after `v0.6.0`
+
+- **Metal backend** for macOS on Apple Silicon, and `--dump-post`
+  ([`2516c48`](https://github.com/softnodelabs/trellis.cpp/commit/2516c48)).
+- **Bounded memory for dense res-1024 decodes** (upstream PR #46,
+  [`c8cc686`](https://github.com/softnodelabs/trellis.cpp/commit/c8cc686)).
+- **FlashAttention skipped when the key sequence is shorter than one tile**
+  ([`d4be13d`](https://github.com/softnodelabs/trellis.cpp/commit/d4be13d)).
+- **The tensor is named when a checkpoint's shapes do not fit the graph**
+  ([`94ca2c5`](https://github.com/softnodelabs/trellis.cpp/commit/94ca2c5)).
+- **Model conversion omits the regenerated dense RoPE phases**
+  ([`1230b99`](https://github.com/softnodelabs/trellis.cpp/commit/1230b99)).
+- **ggml moved to current master**
+  ([`0e51f5f`](https://github.com/softnodelabs/trellis.cpp/commit/0e51f5f)).
+
+### Not taken from upstream
+
+Upstream's work from `v0.7.0` on is not merged:
+
+- **Its own Pixal3D port.** It changes the same DiT and conditioning code as the
+  multiview port above.
+- **Native quad retopology export.**
+- **Windows ARM64 and Hexagon support, and the multi-backend accelerator
+  scheduler.**
+- **Server options that choose the model family and camera per request.**
+
 ## Quick start
 
 New here? **Trellis Studio** is a one-command install that auto-detects your GPU
