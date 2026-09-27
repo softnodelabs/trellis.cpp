@@ -340,12 +340,14 @@ void clean_mesh(int V, std::vector<int32_t>& faces) {
     // 3. BFS flood; flip faces to a consistent winding across manifold (exactly-2-face) edges.
     // Non-manifold / boundary edges are not crossed, so orientation stays locally consistent.
     std::vector<char> vis(F, 0), flip(F, 0);
-    std::vector<int> st;
+    std::vector<int> st, region;
     for (int seed = 0; seed < F; ++seed) {
         if (vis[seed]) continue;
         vis[seed] = 1; st.push_back(seed);
+        region.clear();
         while (!st.empty()) {
             int f = st.back(); st.pop_back();
+            region.push_back(f);
             int v[3] = { faces[3*f], faces[3*f+1], faces[3*f+2] };
             if (flip[f]) std::swap(v[1], v[2]);
             for (int j = 0; j < 3; ++j) {
@@ -361,6 +363,13 @@ void clean_mesh(int V, std::vector<int32_t>& faces) {
                 vis[g] = 1; st.push_back(g);
             }
         }
+        // The flood follows the seed's winding. When the seed is itself one of a few faces wound
+        // against their neighbours, that would turn the whole region inside out, so the region
+        // keeps the winding most of its faces already have.
+        size_t flipped = 0;
+        for (int f : region) flipped += flip[f] ? 1 : 0;
+        if (flipped * 2 > region.size())
+            for (int f : region) flip[f] = !flip[f];
     }
     int nf = 0;
     for (int f = 0; f < F; ++f) if (flip[f]) { std::swap(faces[3*f+1], faces[3*f+2]); ++nf; }
@@ -1072,6 +1081,12 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
             }
         }
         const float kAreaW = 0.1f, kPerimW = 1e-4f, kMaxCost = 1.5707963f;
+        // Not in the reference: xatlas charts each cluster as one mesh on one thread, and its cost
+        // grows faster than the cluster, so a few huge clusters leave the other cores idle. On a
+        // closed single-surface 1M-face mesh the largest cluster reached 102k faces and charting
+        // took 250 s instead of 90; capped here it takes about 110 s. Clusters of the usual size
+        // are untouched.
+        const int kMaxClusterFaces = 50000;
         std::vector<int> remap((size_t)NB);
         for (int round = 0; round < 256; ++round) {
             // compress chart ids
@@ -1082,10 +1097,12 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
             if (C <= 1) break;
             // per-chart cone / area / perimeter
             std::vector<float> axis((size_t)C * 3, 0.f), half((size_t)C, 0.f), carea((size_t)C, 0.f), cperim((size_t)C, 0.f);
+            std::vector<int> ccount((size_t)C, 0);
             for (int i = 0; i < NB; ++i) {
                 const int c = chart[i];
                 for (int k = 0; k < 3; ++k) axis[3*c+k] += fn[3*i+k];
                 carea[c] += farea[i];
+                ++ccount[c];
             }
             for (int c = 0; c < C; ++c) {
                 const float l = std::sqrt(axis[3*c]*axis[3*c]+axis[3*c+1]*axis[3*c+1]+axis[3*c+2]*axis[3*c+2]);
@@ -1148,6 +1165,7 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
             for (size_t e = 0; e < pairs.size(); ++e) {
                 const Pair& p = pairs[e];
                 if (p.cost > kMaxCost) continue;
+                if (ccount[p.c0] + ccount[p.c1] > kMaxClusterFaces) continue;
                 if (cmin[p.c0] != (int)e || cmin[p.c1] != (int)e) continue;
                 cmap[p.c1] = p.c0;
                 any = true;
@@ -1189,8 +1207,7 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
             for (int32_t ov : cm.l2orig) v2l[ov] = -1;
         }
     }
-    printf("  uv_bake: %zu merge clusters\n", clusters.size());
-    fflush(stdout);
+    printf("  uv_bake: %zu merge clusters\n", clusters.size());    fflush(stdout);
 
     // Reference add_mesh passes positions only — no normals, no custom epsilon
     // (cumesh.py:453-458).
