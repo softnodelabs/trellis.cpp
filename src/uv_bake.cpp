@@ -3,6 +3,7 @@
 #include "meshoptimizer.h"
 #include "Simplify.h"
 #include "tri_bvh.h"
+#include "trellis_args.h"
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -1211,6 +1212,7 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
 
     // Reference add_mesh passes positions only — no normals, no custom epsilon
     // (cumesh.py:453-458).
+    xatlas::SetThreadCount((uint32_t)cpu_thread_count());
     xatlas::Atlas* atlas = xatlas::Create();
     for (auto& cm : cms) {
         xatlas::MeshDecl md;

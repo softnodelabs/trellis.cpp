@@ -94,6 +94,10 @@ struct Atlas
 	float texelsPerUnit; // Equal to PackOptions texelsPerUnit if texelsPerUnit > 0, otherwise an estimated value to match PackOptions resolution.
 };
 
+// trellis.cpp: the threads an atlas created after this call uses, the calling thread included.
+// 0, the default, is every core.
+void SetThreadCount(uint32_t count);
+
 // Create an empty atlas.
 Atlas *Create();
 

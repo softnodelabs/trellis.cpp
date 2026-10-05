@@ -100,7 +100,9 @@ binaries install **upstream's** build, not this fork. Build this fork from sourc
   ([`a161471`](https://github.com/softnodelabs/trellis.cpp/commit/a161471)).
   - `cpu_thread_count()` (`trellis_args.h`) is now used by the remesh, the
     deformable convolution's CPU path, NAF's CPU loops and xatlas's task
-    scheduler, as well as the ggml CPU backend. Before, only the backend read
+    scheduler, as well as the ggml CPU backend. xatlas takes it through a new
+    `xatlas::SetThreadCount` (0, its default, is every core), so the vendored
+    xatlas still builds on its own. Before, only the backend read
     `--threads` / `TRELLIS_THREADS`; the rest took every core.
   - On Apple Silicon the default is the performance cores
     (`hw.perflevel0.physicalcpu`), so the efficiency cores keep the machine

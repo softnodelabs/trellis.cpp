@@ -160,10 +160,6 @@ Copyright (c) 2012 Brandon Pelfrey
 #define XA_SPRINTF(_buffer, _size, _format, ...) sprintf(_buffer, _format, __VA_ARGS__)
 #endif
 
-// trellis.cpp: the scheduler takes the thread count every CPU stage uses (trellis_args.h) instead
-// of every core.
-namespace trellis { int cpu_thread_count(); }
-
 namespace xatlas {
 namespace internal {
 
@@ -3128,13 +3124,18 @@ struct Task
 };
 
 #if XA_MULTITHREADED
+// trellis.cpp: the thread count a scheduler takes when it is created (SetThreadCount), 0 for every
+// core as upstream does.
+static std::atomic<uint32_t> s_threadCount{0};
+
 class TaskScheduler
 {
 public:
 	TaskScheduler() : m_shutdown(false)
 	{
 		m_threadIndex = 0;
-		m_threadCount = max(1u, (uint32_t)trellis::cpu_thread_count());
+		const uint32_t requested = s_threadCount.load();
+		m_threadCount = max(1u, requested ? requested : std::thread::hardware_concurrency());
 		// Max with current task scheduler usage is 1 per thread + 1 deep nesting, but allow for some slop.
 		m_maxGroups = m_threadCount * 4;
 		m_groups = XA_ALLOC_ARRAY(MemTag::Default, TaskGroup, m_maxGroups);
@@ -8898,6 +8899,15 @@ struct Context
 	internal::Array<internal::UvMeshInstance *> uvMeshInstances;
 	bool uvMeshChartsComputed = false;
 };
+
+void SetThreadCount(uint32_t count)
+{
+#if XA_MULTITHREADED
+	internal::s_threadCount = count;
+#else
+	XA_UNUSED(count);
+#endif
+}
 
 Atlas *Create()
 {
