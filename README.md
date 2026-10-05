@@ -96,6 +96,22 @@ binaries install **upstream's** build, not this fork. Build this fork from sourc
   - A load that failed after allocating (a truncated file, say) left the backend,
     the full weight buffer and the gguf contexts allocated.
   - All of them are now freed on every error path, and the file is closed.
+- **One thread count for every CPU stage**
+  ([`a161471`](https://github.com/softnodelabs/trellis.cpp/commit/a161471)).
+  - `cpu_thread_count()` (`trellis_args.h`) is now used by the remesh, the
+    deformable convolution's CPU path, NAF's CPU loops and xatlas's task
+    scheduler, as well as the ggml CPU backend. Before, only the backend read
+    `--threads` / `TRELLIS_THREADS`; the rest took every core.
+  - On Apple Silicon the default is the performance cores
+    (`hw.perflevel0.physicalcpu`), so the efficiency cores keep the machine
+    responsive through a long CPU stage. Elsewhere it is every core, as before.
+    On a 10-core M4 a Pixal3D run used 43% less CPU time (BiRefNet's deformable
+    convolution on 4 cores instead of 10) in the same wall time.
+  - The remesh's candidate bitset is marked by slabs of x planes, each worker
+    writing only its own whole words of the shared bitset, instead of each
+    worker filling a private res³ copy (128 MiB at res 1024) that was then
+    merged. The output is bit-identical, and the per-worker copies and their
+    1 GiB cap are gone.
 - **Build fix**: `dit.cpp` includes `<stdexcept>` for its checkpoint shape error
   ([`9249b57`](https://github.com/softnodelabs/trellis.cpp/commit/9249b57)).
 
