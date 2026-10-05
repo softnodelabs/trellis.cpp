@@ -1,5 +1,6 @@
 #include "naf.h"
 #include "trellis_model.h"
+#include "trellis_args.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -22,7 +23,7 @@ namespace trellis {
 namespace {
 
 // Minimal internal parallel-for: splits [0,n) into contiguous, statically
-// sized ranges (one per thread, hardware_concurrency()-capped) and runs
+// sized ranges (one per thread, cpu_thread_count()-capped) and runs
 // fn(begin,end) for each range on its own std::thread; the caller's fn
 // processes indices in that range in the same order it would serially.
 // This is used only where the callee's writes for distinct indices are to
@@ -36,9 +37,7 @@ static void naf_parallel_for(int n, Fn&& fn) {
 #ifdef __EMSCRIPTEN__
     fn(0, n);   // pthread 無しでリンクしているので std::thread は生成できない
 #else
-    unsigned hw = std::thread::hardware_concurrency();
-    if (hw == 0) hw = 4;
-    int nthreads = (int)std::min<unsigned>(hw, (unsigned)n);
+    int nthreads = std::min(cpu_thread_count(), n);
     if (nthreads <= 1) { fn(0, n); return; }
     const int chunk = (n + nthreads - 1) / nthreads;
     std::vector<std::thread> pool;

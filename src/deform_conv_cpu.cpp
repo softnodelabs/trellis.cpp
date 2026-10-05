@@ -3,6 +3,7 @@
 // on builds without the CUDA kernel (Vulkan / CPU-only). Host arrays in/out, same
 // NCHW C-order layout as the CUDA path; parallelized over output channels.
 #include "deform_conv.h"
+#include "trellis_args.h"
 
 #include <algorithm>
 #include <chrono>
@@ -65,8 +66,7 @@ void deform_conv2d_cpu(const float* x, int Cin, int H, int W,
         }
     };
 
-    const unsigned hw_threads = std::thread::hardware_concurrency();
-    const int nthreads = std::max(1, std::min<int>(Cout, hw_threads ? (int)hw_threads : 4));
+    const int nthreads = std::max(1, std::min<int>(Cout, cpu_thread_count()));
     if (nthreads <= 1) {
         compute_range(0, Cout);
     } else {

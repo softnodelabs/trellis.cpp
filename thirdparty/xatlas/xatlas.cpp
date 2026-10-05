@@ -160,6 +160,10 @@ Copyright (c) 2012 Brandon Pelfrey
 #define XA_SPRINTF(_buffer, _size, _format, ...) sprintf(_buffer, _format, __VA_ARGS__)
 #endif
 
+// trellis.cpp: the scheduler takes the thread count every CPU stage uses (trellis_args.h) instead
+// of every core.
+namespace trellis { int cpu_thread_count(); }
+
 namespace xatlas {
 namespace internal {
 
@@ -3130,8 +3134,9 @@ public:
 	TaskScheduler() : m_shutdown(false)
 	{
 		m_threadIndex = 0;
+		m_threadCount = max(1u, (uint32_t)trellis::cpu_thread_count());
 		// Max with current task scheduler usage is 1 per thread + 1 deep nesting, but allow for some slop.
-		m_maxGroups = std::thread::hardware_concurrency() * 4;
+		m_maxGroups = m_threadCount * 4;
 		m_groups = XA_ALLOC_ARRAY(MemTag::Default, TaskGroup, m_maxGroups);
 		for (uint32_t i = 0; i < m_maxGroups; i++) {
 			new (&m_groups[i]) TaskGroup();
@@ -3139,7 +3144,9 @@ public:
 			m_groups[i].ref = 0;
 			m_groups[i].userData = nullptr;
 		}
-		m_workers.resize(std::thread::hardware_concurrency() <= 1 ? 1 : std::thread::hardware_concurrency() - 1);
+		// The calling thread is thread 0 and runs tasks in wait(), so one thread means no workers
+		// (one worker would be thread 1, past the per-thread arrays sized by threadCount()).
+		m_workers.resize(m_threadCount - 1);
 		for (uint32_t i = 0; i < m_workers.size(); i++) {
 			new (&m_workers[i]) Worker();
 			m_workers[i].wakeup = false;
@@ -3168,7 +3175,7 @@ public:
 
 	uint32_t threadCount() const
 	{
-		return max(1u, std::thread::hardware_concurrency()); // Including the main thread.
+		return m_threadCount; // Including the main thread.
 	}
 
 	// userData is passed to Task::func as groupUserData.
@@ -3263,6 +3270,7 @@ private:
 	Array<Worker> m_workers;
 	std::atomic<bool> m_shutdown;
 	uint32_t m_maxGroups;
+	uint32_t m_threadCount;
 	static thread_local uint32_t m_threadIndex;
 
 	static void workerThread(TaskScheduler *scheduler, Worker *worker, uint32_t threadIndex)

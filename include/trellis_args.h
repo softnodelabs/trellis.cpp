@@ -12,6 +12,12 @@ extern bool g_no_fa;            // defined in dit.cpp           (TRELLIS_NOFA)
 extern bool g_require_gpu;      // defined in trellis_model.cpp (TRELLIS_REQUIRE_GPU)
 extern int  g_cpu_threads;      // defined in trellis_model.cpp (TRELLIS_THREADS)
 
+// The thread count every CPU stage uses: the ggml CPU backend, the remesh, the decimation, the UV
+// unwrap and bake, NAF and the deformable convolution's CPU path. g_cpu_threads when set, else
+// TRELLIS_THREADS, else the performance cores on Apple Silicon (so the efficiency cores keep the
+// machine responsive through a long CPU stage) and every core elsewhere.
+int cpu_thread_count();
+
 // Every knob for one TRELLIS.2 image->3D run. Resolved as default -> environment
 // (the historical TRELLIS_* / GSS / GSH names) -> CLI flag, with the CLI winning.
 // trellis-cli and trellis-server share the parser: the server runs it once for its

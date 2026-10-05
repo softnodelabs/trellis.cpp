@@ -1,6 +1,7 @@
 #include "remesh_dc.h"
 #include "tri_bvh.h"
 #include "uv_bake.h"
+#include "trellis_args.h"
 #include <algorithm>
 #include <atomic>
 #ifdef _MSC_VER
@@ -32,7 +33,7 @@ inline uint64_t key3(int x, int y, int z) {
 }
 
 void parallel_for(int64_t n, const std::function<void(int64_t, int64_t)>& fn) {
-    const int nt = std::max(1u, std::thread::hardware_concurrency());
+    const int nt = std::max(1, cpu_thread_count());
     std::vector<std::thread> ts;
     const int64_t chunk = (n + nt - 1) / nt;
     for (int t = 0; t < nt; ++t) {
@@ -538,36 +539,20 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
     // index distance is < band+1.37, i.e. ≤ band+1.
     const int dil = band + 1;
     {
+        // Each worker owns a slab of x planes and marks only the cells inside it, straight into
+        // the shared bitset, scanning every face's box. A plane is res*res bits, a whole number of
+        // 64-bit words whenever res is a multiple of 8, so two slabs never share a word: no
+        // per-worker copy of the bitset (128 MiB each at res 1024) and no merge, and the result is
+        // the same set of bits. Any other res marks on one thread.
         const int F = (int)iF;
-        std::vector<std::vector<uint64_t>> parts;
-        const int hw = (int)std::max(1u, std::thread::hardware_concurrency());
-        // Each worker previously allocated a full res^3 candidate bitset.  At
-        // res=1024 that is 128 MiB per worker, so a 32-thread CPU consumed ~4 GiB
-        // here before any geometry/BVH memory.  Cap only the replication memory;
-        // the OR result and therefore the remesh are bit-for-bit equivalent.
-        const size_t bytes_per_part = cand.size() * sizeof(uint64_t);
-        const size_t parts_budget = (size_t)1024 * 1024 * 1024; // 1 GiB
-        const int mem_workers = bytes_per_part ? (int)std::max<size_t>(1, parts_budget / bytes_per_part) : hw;
-        const int nt = std::max(1, std::min(hw, mem_workers));
-        if (nt < hw) {
-            printf("  [remesh-mem] candidate bitset %.1f MiB/worker, workers %d->%d\n",
-                   bytes_per_part / (1024.0*1024.0), hw, nt);
-            fflush(stdout);
-        }
-        parts.assign(nt, {});
+        const int nt = ((int64_t)res * res) % 64 == 0 ? std::max(1, std::min(cpu_thread_count(), res)) : 1;
         std::vector<std::thread> ts;
-        const int chunk = (F + nt - 1) / nt;
+        const int slab = (res + nt - 1) / nt;
         for (int t = 0; t < nt; ++t) {
-            const int b = t * chunk, e = std::min(F, b + chunk);
-            if (b >= e) break;
-            parts[t].assign(cand.size(), 0);
-            ts.emplace_back([&, t, b, e]() {
-                auto& bits = parts[t];
-                auto setb = [&bits, res](int x, int y, int z) {
-                    const int64_t i = ((int64_t)x * res + y) * res + z;
-                    bits[(size_t)(i >> 6)] |= 1ull << (i & 63);
-                };
-                for (int f = b; f < e; ++f) {
+            const int x0 = t * slab, x1 = std::min(res, x0 + slab) - 1;
+            if (x0 > x1) break;
+            ts.emplace_back([&, x0, x1]() {
+                for (int f = 0; f < F; ++f) {
                     float bmin[3] = {1e30f, 1e30f, 1e30f}, bmax[3] = {-1e30f, -1e30f, -1e30f};
                     for (int j = 0; j < 3; ++j) {
                         const float* p = &iverts[3 * ifaces[3*f+j]];
@@ -581,16 +566,15 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                         c0[k] = std::max(0, (int)std::floor((bmin[k] / scale + 0.5f) * res) - dil);
                         c1[k] = std::min(res - 1, (int)std::floor((bmax[k] / scale + 0.5f) * res) + dil);
                     }
+                    c0[0] = std::max(c0[0], x0);
+                    c1[0] = std::min(c1[0], x1);
                     for (int x = c0[0]; x <= c1[0]; ++x)
                         for (int y = c0[1]; y <= c1[1]; ++y)
-                            for (int z = c0[2]; z <= c1[2]; ++z) setb(x, y, z);
+                            for (int z = c0[2]; z <= c1[2]; ++z) bit_set(x, y, z);
                 }
             });
         }
         for (auto& th : ts) th.join();
-        for (auto& bits : parts)
-            if (!bits.empty())
-                for (size_t i = 0; i < cand.size(); ++i) cand[i] |= bits[i];
     }
 
     // Active voxels: |UDF(center) - eps| < 0.87*cell (spec 27 §4.1).

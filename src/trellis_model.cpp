@@ -1,4 +1,5 @@
 #include "trellis_model.h"
+#include "trellis_args.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -18,6 +19,10 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
+
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 
 namespace {
 // plain fseek()'s offset is a 32-bit `long` under MSVC even in 64-bit builds,
@@ -42,12 +47,18 @@ int  g_cpu_threads = 0;       // --threads; 0 = all cores. Set by trellis_run.
 // 20-core host, sparse-structure flow: 305s/step before, 118s/step after
 // (2.6x). Resolve the count here (flag -> TRELLIS_THREADS -> all cores) and
 // hand it to every CPU backend we create.
-static int cpu_thread_count() {
+int cpu_thread_count() {
     if (g_cpu_threads > 0) return g_cpu_threads;
     if (const char* e = getenv("TRELLIS_THREADS")) {
         int n = atoi(e);
         if (n > 0) return n;
     }
+#ifdef __APPLE__
+    // perflevel0 is the performance cluster; a chip without levels (none ships) reports nothing.
+    int perf = 0;
+    size_t len = sizeof(perf);
+    if (sysctlbyname("hw.perflevel0.physicalcpu", &perf, &len, nullptr, 0) == 0 && perf > 0) return perf;
+#endif
     unsigned hw = std::thread::hardware_concurrency();
     return hw > 0 ? (int) hw : 4;
 }
