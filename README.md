@@ -114,6 +114,16 @@ binaries install **upstream's** build, not this fork. Build this fork from sourc
     worker filling a private res³ copy (128 MiB at res 1024) that was then
     merged. The output is bit-identical, and the per-worker copies and their
     1 GiB cap are gone.
+- **BiRefNet's deformable convolution on Metal**
+  ([`22796ab`](https://github.com/softnodelabs/trellis.cpp/commit/22796ab)).
+  - A backend with no deformable-conv kernel of its own (Metal; CUDA, HIP and
+    Vulkan have one) ran it as a host loop, about 160 s per 1024 matte on an M4.
+  - It now runs as ggml ops inside the decoder block's graph: per tap,
+    `get_rows` gathers the four bilinear corners, they are weighted and summed,
+    and one `mul_mat` applies that tap's slice of the kernel.
+  - On an M4 a whole cutout takes 8.0 s instead of 162.8 s. Mattes match the
+    host loop's to within 1/255. `TRELLIS_DEFORM_HOST=1` forces the host loop,
+    which CPU builds keep.
 - **Build fix**: `dit.cpp` includes `<stdexcept>` for its checkpoint shape error
   ([`9249b57`](https://github.com/softnodelabs/trellis.cpp/commit/9249b57)).
 
