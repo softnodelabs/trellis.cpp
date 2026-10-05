@@ -12,6 +12,11 @@ void deform_conv2d_run(const float* x, int Cin, int H, int W,
                        const float* weight, const float* bias, int Cout, int K,
                        float* out, int gpu);
 
+// Whether deform_conv2d_run has a GPU kernel in this build (CUDA, HIP or Vulkan). Without one,
+// BiRefNet on a GPU backend runs the convolution as ggml ops in its own graph instead
+// (birefnet.cpp), since the host loop is minutes at the decoder's larger scales.
+bool deform_conv2d_has_gpu_kernel();
+
 // Portable CPU implementation. Used directly on pure-CPU builds and as the Vulkan
 // path's fallback when no compute device is usable.
 void deform_conv2d_cpu(const float* x, int Cin, int H, int W,

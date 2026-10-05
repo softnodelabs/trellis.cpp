@@ -99,6 +99,8 @@ void deform_conv2d_run(const float* x, int Cin, int H, int W,
                        float* out, int gpu) {
     deform_conv2d_cpu(x, Cin, H, W, offset, mask, weight, bias, Cout, K, out, gpu);
 }
+
+bool deform_conv2d_has_gpu_kernel() { return false; }
 #endif
 
 } // namespace trellis

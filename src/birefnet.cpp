@@ -1,7 +1,8 @@
 // BiRefNet (Swin-L backbone + ASPPDeformable decoder) in GGML. The backbone runs as one graph per
 // input scale; window partition / shifted-window roll / attention mask are precomputed on the host
 // as gather/scatter index arrays + an additive mask, applied via ggml_get_rows. Each decoder block
-// runs as two graphs around its deformable convolutions, the one step done by a custom kernel.
+// runs as two graphs around its deformable convolutions, the one step done by a custom kernel, or
+// on a GPU without one (Metal) by ggml ops inside the second graph.
 // Validated against tools/ref_birefnet.py dumps.
 #include "birefnet.h"
 #include "deform_conv.h"
@@ -286,7 +287,7 @@ static Feat image2patches(const Feat& img, int Href, int Wref) {  // 'b c (hg h)
 // arithmetic the decoder is made of. Every feature map is ggml [W,H,C], which is torch [C,H,W].
 struct DecGraph {
     const Model& m;
-    ggml_context* c = mkctx(4096);
+    ggml_context* c = mkctx(8192);
     std::vector<std::pair<T*, const void*>> ins;
 
     explicit DecGraph(const Model& model) : m(model) {}
@@ -297,6 +298,11 @@ struct DecGraph {
     T* in(const Feat& f) {
         T* t = ggml_new_tensor_3d(c, GGML_TYPE_F32, f.W, f.H, f.C);
         ggml_set_input(t); ins.push_back({t, f.d.data()});
+        return t;
+    }
+    T* in_1d(ggml_type type, int64_t n, const void* data) {         // data outlives run()
+        T* t = ggml_new_tensor_1d(c, type, n);
+        ggml_set_input(t); ins.push_back({t, data});
         return t;
     }
     T* conv(const std::string& p, T* x, int pad) {                  // stride 1, bias if the model has one
@@ -318,7 +324,7 @@ struct DecGraph {
         return r;
     }
     std::vector<Feat> run(std::vector<T*> outs) {
-        std::vector<std::vector<float>> r = run_graph(m, c, outs, ins, 4096);
+        std::vector<std::vector<float>> r = run_graph(m, c, outs, ins, 8192);
         std::vector<Feat> f(outs.size());
         for (size_t i = 0; i < outs.size(); ++i) {
             f[i].d = std::move(r[i]);
@@ -327,6 +333,79 @@ struct DecGraph {
         return f;
     }
 };
+
+// Where each tap of a modulated deformable convolution samples, as torchvision's bilinear sampling
+// does it: for tap t, corner k and output pixel p, the input pixel idx[(t*4+k)*P + p] and its weight
+// w[...], the modulation already folded in. A corner outside the map gets weight 0 (and index 0),
+// which is torchvision's zero padding. Plain arithmetic over the offsets, so it runs on the host.
+struct DeformSampling { std::vector<int32_t> idx; std::vector<float> w; };
+
+static DeformSampling deform_sampling(const Feat& offset, const Feat& mask, int K) {
+    const int H = offset.H, W = offset.W, K2 = K * K, pad = K / 2;
+    const size_t P = (size_t)H * W;
+    DeformSampling s;
+    s.idx.assign((size_t)K2 * 4 * P, 0);
+    s.w.assign((size_t)K2 * 4 * P, 0.f);
+    for (int t = 0; t < K2; ++t) {
+        const int kh = t / K, kw = t % K;
+        int32_t* idx = s.idx.data() + (size_t)t * 4 * P;
+        float* w = s.w.data() + (size_t)t * 4 * P;
+        for (size_t p = 0; p < P; ++p) {
+            const int oy = (int)(p / W), ox = (int)(p % W);
+            const float h = (float)(oy - pad + kh) + offset.d[(size_t)(2*t) * P + p];
+            const float x = (float)(ox - pad + kw) + offset.d[(size_t)(2*t+1) * P + p];
+            if (h <= -1.f || (float)H <= h || x <= -1.f || (float)W <= x) continue;
+            const float m = mask.d[(size_t)t * P + p];
+            const int h0 = (int)std::floor(h), x0 = (int)std::floor(x), h1 = h0 + 1, x1 = x0 + 1;
+            const float lh = h - h0, lw = x - x0, hh = 1.f - lh, hw = 1.f - lw;
+            const int ys[4] = { h0, h0, h1, h1 }, xs[4] = { x0, x1, x0, x1 };
+            const float ws[4] = { hh * hw, hh * lw, lh * hw, lh * lw };
+            for (int k = 0; k < 4; ++k) {
+                if (ys[k] < 0 || ys[k] > H - 1 || xs[k] < 0 || xs[k] > W - 1) continue;
+                idx[(size_t)k * P + p] = ys[k] * W + xs[k];
+                w[(size_t)k * P + p] = m * ws[k];
+            }
+        }
+    }
+    return s;
+}
+
+// The modulated deformable convolution as ggml ops: per tap, the four corners are gathered with
+// get_rows from the input laid out one pixel per row, weighted and summed, and one mul_mat applies
+// that tap's slice of the kernel. Accumulating tap by tap keeps the largest intermediate at one
+// [Cin, pixels] map (16 MB at the decoder's 256x256 block) instead of the taps x corners x Cin x
+// pixels gather (3.3 GB there for the 7x7 branch). x is [W,H,Cin]; returns [W,H,Cout].
+static T* deform_conv_graph(DecGraph& g, T* x, const DeformSampling& s, T* weight) {
+    ggml_context* c = g.c;
+    const int64_t W = x->ne[0], H = x->ne[1], Cin = x->ne[2], P = W * H;
+    const int64_t K = weight->ne[0], K2 = K * K, Cout = weight->ne[3];
+    T* rows = ggml_cont(c, ggml_transpose(c, ggml_reshape_2d(c, x, P, Cin)));            // [Cin, P]
+    T* kernel = ggml_cont(c, ggml_permute(c, ggml_reshape_3d(c, weight, K2, Cin, Cout), 2, 0, 1, 3));  // [Cin,Cout,K2]
+    T* idx = g.in_1d(GGML_TYPE_I32, K2 * 4 * P, s.idx.data());
+    T* wts = g.in_1d(GGML_TYPE_F32, K2 * 4 * P, s.w.data());
+    T* acc = nullptr;
+    for (int64_t t = 0; t < K2; ++t) {
+        T* sampled = nullptr;
+        for (int64_t k = 0; k < 4; ++k) {
+            const size_t at = (size_t)(t * 4 + k) * P;
+            T* corner = ggml_get_rows(c, rows, ggml_view_1d(c, idx, P, at * sizeof(int32_t)));     // [Cin, P]
+            corner = ggml_mul(c, corner, ggml_view_2d(c, wts, 1, P, sizeof(float), at * sizeof(float)));
+            sampled = sampled ? ggml_add(c, sampled, corner) : corner;
+        }
+        T* tap = ggml_mul_mat(c, ggml_view_2d(c, kernel, Cin, Cout, kernel->nb[1], t * kernel->nb[2]), sampled);  // [Cout, P]
+        acc = acc ? ggml_add(c, acc, tap) : tap;
+    }
+    return ggml_reshape_3d(c, ggml_cont(c, ggml_transpose(c, acc)), W, H, Cout);
+}
+
+// Whether the deformable convolutions run as ggml ops (deform_conv_graph) rather than through
+// deform_conv2d_run: on a GPU backend this build has no kernel for, which is Metal. The host loop
+// stays for CPU builds, and TRELLIS_DEFORM_HOST=1 forces it, to compare the two on one image.
+static bool deform_on_graph(const Model& m, T* weight) {
+    if (getenv("TRELLIS_DEFORM_HOST") || deform_conv2d_has_gpu_kernel() || weight->type != GGML_TYPE_F32) return false;
+    ggml_backend_dev_t dev = ggml_backend_get_device(m.backend);
+    return dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+}
 
 // The four deformable branches of an ASPPDeformable, in the order the aspp concatenates them.
 static const char* DEFORM_BRANCHES[4] = { ".aspp1", ".aspp_deforms.0", ".aspp_deforms.1", ".aspp_deforms.2" };
@@ -360,18 +439,27 @@ static Feat dec_block(const Model& m, const std::string& p, const std::function<
         for (int i = 0; i < 4; ++i) { offs[i] = std::move(r[1 + 2*i]); mods[i] = std::move(r[2 + 2*i]); }
         pooled = std::move(r[9]);
     }
+    T* weights[4];
+    for (int i = 0; i < 4; ++i) weights[i] = m.get(a + DEFORM_BRANCHES[i] + ".atrous_conv.regular_conv.weight");
+    const bool on_graph = std::all_of(weights, weights + 4, [&](T* w) { return deform_on_graph(m, w); });
     Feat d[4];
+    DeformSampling sampling[4];
     for (int i = 0; i < 4; ++i) {
-        T* w = m.get(a + DEFORM_BRANCHES[i] + ".atrous_conv.regular_conv.weight");
+        T* w = weights[i];
         const int K = (int)w->ne[0], OC = (int)w->ne[3];
+        if (on_graph) { sampling[i] = deform_sampling(offs[i], mods[i], K); continue; }
         std::vector<float> wt = tensor_to_f32(w);                    // [KW,KH,Cin,OC] == [OC,Cin,K,K] C-order
         d[i].C = OC; d[i].H = o.H; d[i].W = o.W; d[i].d.resize((size_t)OC * o.H * o.W);
         deform_conv2d_run(o.d.data(), o.C, o.H, o.W, offs[i].d.data(), mods[i].d.data(), wt.data(), nullptr,
                           OC, K, d[i].d.data(), gpu);
     }
     DecGraph g(m);
+    T* block_in = on_graph ? g.in(o) : nullptr;
     std::vector<T*> branches;
-    for (int i = 0; i < 4; ++i) branches.push_back(ggml_relu(g.c, g.bn(a + DEFORM_BRANCHES[i] + ".bn", g.in(d[i]))));
+    for (int i = 0; i < 4; ++i) {
+        T* conv = on_graph ? deform_conv_graph(g, block_in, sampling[i], weights[i]) : g.in(d[i]);
+        branches.push_back(ggml_relu(g.c, g.bn(a + DEFORM_BRANCHES[i] + ".bn", conv)));
+    }
     T* pool = g.in(pooled);                                                               // [1,1,OC]
     branches.push_back(ggml_repeat(g.c, pool, ggml_new_tensor_3d(g.c, GGML_TYPE_F32, o.W, o.H, pool->ne[2])));
     T* y = ggml_relu(g.c, g.bn(a + ".bn1", g.conv(a + ".conv1", g.cat(branches), 0)));

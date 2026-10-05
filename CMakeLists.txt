@@ -221,8 +221,9 @@ endif()
 if(TARGET ggml-metal)
   # macOS/Apple Silicon: ggml's Metal backend (GGML_METAL defaults ON for
   # Apple builds). The generic device-enumeration path in make_backend() picks
-  # the Metal GPU automatically; the two custom kernels (deform_conv,
-  # decimate_qem) run their CPU fallbacks on this backend.
+  # the Metal GPU automatically. BiRefNet's deformable conv has no Metal
+  # kernel and runs as ggml ops in its own graph (birefnet.cpp); the QEM
+  # decimation runs its CPU fallback on this backend.
   set(TRELLIS_BUILD_BACKEND "metal")
   target_link_libraries(trellis_core PUBLIC ggml-metal)
   message(STATUS "trellis.cpp: Metal backend enabled")

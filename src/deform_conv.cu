@@ -118,4 +118,6 @@ void deform_conv2d_run(const float* x, int Cin, int H, int W,
     if (dbias) cudaFree(dbias);
 }
 
+bool deform_conv2d_has_gpu_kernel() { return true; }
+
 } // namespace trellis

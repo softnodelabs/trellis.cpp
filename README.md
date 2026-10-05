@@ -390,8 +390,8 @@ cmake --build build -j
 
 On **macOS/Apple Silicon** no backend flag is needed — ggml's Metal backend
 defaults ON for Apple builds and the generic device selection picks the GPU.
-The two custom kernels (BiRefNet deformable conv, QEM decimation) run their
-CPU fallbacks there.
+BiRefNet's deformable conv runs as ggml ops there, and the QEM decimation runs
+its CPU fallback.
 
 See `.github/workflows/release.yml` for the exact flags the release binaries use
 (GPU target lists, `-DGGML_OPENMP=OFF` on Windows). Releases also include a
